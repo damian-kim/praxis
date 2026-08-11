@@ -133,3 +133,65 @@ class RunComparison(BaseModel):
     primary_run_id: str
     comparison_run_id: str
     metrics: list[MetricComparison]
+
+
+class BatchCreate(BaseModel):
+    scenario_id: str = "warehouse_v0"
+    policy_id: str = Field(default="baseline_safe", min_length=1, max_length=200)
+    engine_id: Literal["deterministic_mock_v1", "mujoco_v1"] = "mujoco_v1"
+    seeds: list[int] = Field(min_length=1, max_length=50)
+
+
+class Batch(BaseModel):
+    id: str
+    scenario_id: str
+    policy_id: str
+    engine_id: str
+    seeds: list[int]
+    created_at: datetime
+    counts: dict[str, int]
+    pass_rate: float | None
+    runs: list[Run]
+
+
+class GateConfig(BaseModel):
+    min_candidate_pass_rate: float = Field(default=.90, ge=0, le=1)
+    max_pass_rate_drop: float = Field(default=0, ge=0, le=1)
+    max_mean_collision_increase: float = Field(default=0, ge=0)
+    max_mean_force_increase_n: float = Field(default=0, ge=0)
+    max_mean_duration_increase_s: float = Field(default=2, ge=0)
+
+
+class ExperimentCreate(BaseModel):
+    scenario_id: str = "warehouse_v0"
+    candidate_policy_id: str = Field(min_length=1, max_length=200)
+    baseline_policy_id: str = Field(default="baseline_safe", min_length=1, max_length=200)
+    engine_id: Literal["deterministic_mock_v1", "mujoco_v1"] = "mujoco_v1"
+    seeds: list[int] = Field(min_length=1, max_length=50)
+    gates: GateConfig = Field(default_factory=GateConfig)
+
+
+class SeedComparison(BaseModel):
+    seed: int
+    candidate_run: Run
+    baseline_run: Run
+    metric_deltas: dict[str, float | None]
+    failure_reasons: list[str]
+
+
+class Experiment(BaseModel):
+    id: str
+    scenario_id: str
+    candidate_policy_id: str
+    baseline_policy_id: str
+    engine_id: str
+    seeds: list[int]
+    candidate_batch_id: str
+    baseline_batch_id: str
+    gates: GateConfig
+    created_at: datetime
+    status: Literal["running", "complete"]
+    verdict: Literal["pending", "pass", "fail"]
+    summary: dict
+    gate_results: list[dict]
+    pairs: list[SeedComparison]

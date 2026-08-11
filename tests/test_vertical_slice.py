@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+import pytest
 
 from worldsim.api import create_app
 from worldsim.config import Settings
@@ -14,6 +16,8 @@ from worldsim.scenario import load_scenario
 from worldsim.evidence import verify_evidence_bundle
 from worldsim.policy import EpisodeContext, load_policy
 from worldsim.contracts import PolicyObservation
+from worldsim.policy_runtime import IsolatedPolicyClient, PolicyRuntimeError
+from worldsim.cli import parse_seeds
 from worldsim.store import RunStore
 
 
@@ -206,3 +210,102 @@ def test_queued_run_can_be_cancelled_without_worker(tmp_path: Path) -> None:
 
     assert cancelled and cancelled.status == "cancelled"
     assert store.claim_next() is None
+
+
+def test_policy_subprocess_protocol_and_deadline() -> None:
+    scenario = load_scenario(Path(__file__).resolve().parents[1] / "worlds" / "warehouse_v0" / "scenario.json", 2)
+    context = EpisodeContext(scenario=scenario)
+    observation = PolicyObservation(step=0, sim_time=0, robot_x=10, robot_y=78, heading=0,
+                                    linear_speed_m_s=0, angular_speed_rad_s=0, package_x=68, package_y=32,
+                                    goal_x=86, goal_y=20, carrying=False, grasp_qualified=False, contact_force_n=0)
+    with IsolatedPolicyClient("baseline_safe", context, timeout_ms=100) as client:
+        action = client.act(observation)
+        assert action.schema_version == "1.0"
+        assert action.target_x == 10
+
+    started = time.perf_counter()
+    with IsolatedPolicyClient("python:examples.policies.slow_policy:SlowPolicy", context, timeout_ms=50) as client:
+        with pytest.raises(PolicyRuntimeError, match="exceeded 50 ms"):
+            client.act(observation)
+    assert time.perf_counter() - started < 2
+
+
+def test_durable_batch_deduplicates_seeds_and_aggregates(tmp_path: Path) -> None:
+    settings = settings_for(tmp_path)
+    store = RunStore(settings.db_path)
+    with TestClient(create_app(settings)) as client:
+        response = client.post("/api/batches", json={"scenario_id": "warehouse_v0", "policy_id": "baseline_safe",
+                                                      "engine_id": "deterministic_mock_v1", "seeds": [3, 4, 4]})
+        assert response.status_code == 202
+        batch_id = response.json()["id"]
+        assert len(response.json()["runs"]) == 2
+
+    while claimed := store.claim_next():
+        execute_mock_run(store, claimed, tmp_path, frame_delay=0, scenario_path=settings.scenario_path)
+
+    with TestClient(create_app(settings)) as client:
+        batch = client.get(f"/api/batches/{batch_id}").json()
+    assert batch["counts"] == {"succeeded": 2}
+    assert batch["pass_rate"] == 1
+
+
+def test_policy_deadline_failure_produces_partial_evidence(tmp_path: Path) -> None:
+    from worldsim.mujoco_engine import MujocoEngine
+
+    settings = settings_for(tmp_path)
+    store = RunStore(settings.db_path)
+    store.create_run(RunCreate(policy_id="python:examples.policies.slow_policy:SlowPolicy",
+                               engine_id="mujoco_v1", seed=10))
+    claimed = store.claim_next()
+    assert claimed
+
+    evidence = MujocoEngine(settings.scenario_path).execute(store, claimed, tmp_path, frame_delay=0)
+    failed = store.get_run(claimed.id)
+
+    assert evidence["verdict"] == "error"
+    assert failed and failed.status == "failed"
+    assert "exceeded 100 ms deadline" in failed.error
+    assert evidence["metrics"]["policy_isolated"] is True
+    assert verify_evidence_bundle(tmp_path / "runs" / claimed.id)[0] is True
+
+
+def test_paired_experiment_gates_and_exports(tmp_path: Path) -> None:
+    settings = settings_for(tmp_path)
+    store = RunStore(settings.db_path)
+    with TestClient(create_app(settings)) as client:
+        response = client.post("/api/experiments", json={
+            "scenario_id": "warehouse_v0", "candidate_policy_id": "baseline_risky",
+            "baseline_policy_id": "baseline_safe", "engine_id": "deterministic_mock_v1", "seeds": [1, 2],
+        })
+        assert response.status_code == 202
+        experiment_id = response.json()["id"]
+
+    while claimed := store.claim_next():
+        execute_mock_run(store, claimed, tmp_path, frame_delay=0, scenario_path=settings.scenario_path)
+
+    with TestClient(create_app(settings)) as client:
+        experiment = client.get(f"/api/experiments/{experiment_id}").json()
+        csv_export = client.get(f"/api/experiments/{experiment_id}/export?format=csv")
+        junit_export = client.get(f"/api/experiments/{experiment_id}/export?format=junit")
+
+    assert experiment["status"] == "complete"
+    assert experiment["verdict"] == "fail"
+    assert experiment["summary"]["candidate_pass_rate"] == 0
+    assert experiment["summary"]["baseline_pass_rate"] == 1
+    assert all("max_collisions" in pair["failure_reasons"] for pair in experiment["pairs"])
+    assert "candidate_verdict" in csv_export.text
+    assert "<testsuite" in junit_export.text
+    assert "experiment_gate" in junit_export.text
+
+
+def test_batch_cancellation_and_seed_parser(tmp_path: Path) -> None:
+    settings = settings_for(tmp_path)
+    with TestClient(create_app(settings)) as client:
+        batch = client.post("/api/batches", json={"scenario_id": "warehouse_v0", "policy_id": "baseline_safe",
+                                                   "engine_id": "deterministic_mock_v1", "seeds": [1, 2, 3]}).json()
+        cancelled = client.post(f"/api/batches/{batch['id']}/cancel").json()
+
+    assert cancelled["counts"] == {"cancelled": 3}
+    assert parse_seeds("1..3, 3, 7") == [1, 2, 3, 7]
+    with pytest.raises(ValueError):
+        parse_seeds("5..2")

@@ -13,6 +13,9 @@ dependencies = [
   "uvicorn>=0.34"
 ]
 
+[project.scripts]
+praxis = "worldsim.cli:main"
+
 [project.optional-dependencies]
 dev = ["httpx2>=2.10", "pytest>=8.3"]
 physics = ["mujoco==3.11.0"]

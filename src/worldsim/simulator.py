@@ -89,6 +89,7 @@ def execute_mock_run(store: RunStore, run: Run, evidence_root: Path, frame_delay
         "max_contact_force_n": max_force,
         "sim_duration_s": frames[-1]["sim_time"],
         "frames_recorded": len(frames),
+        "actuator_energy_j": 0.0,
         "deterministic_seed": run.seed,
     }
     verdict, checks = ("cancelled", []) if cancelled else evaluate(metrics, scenario)

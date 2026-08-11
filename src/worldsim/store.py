@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Iterator
 
-from .contracts import Frame, Run, RunCreate, RunDetail
+from .contracts import Batch, BatchCreate, Experiment, ExperimentCreate, Frame, GateConfig, Run, RunCreate, RunDetail, SeedComparison
 
 
 def now_iso() -> str:
@@ -92,6 +92,32 @@ class RunStore:
                     decision_ms REAL NOT NULL,
                     PRIMARY KEY (run_id, sequence)
                 );
+                CREATE TABLE IF NOT EXISTS batches (
+                    id TEXT PRIMARY KEY,
+                    scenario_id TEXT NOT NULL,
+                    policy_id TEXT NOT NULL,
+                    engine_id TEXT NOT NULL,
+                    seeds_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS batch_runs (
+                    batch_id TEXT NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+                    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                    seed INTEGER NOT NULL,
+                    PRIMARY KEY (batch_id, run_id)
+                );
+                CREATE TABLE IF NOT EXISTS experiments (
+                    id TEXT PRIMARY KEY,
+                    scenario_id TEXT NOT NULL,
+                    candidate_policy_id TEXT NOT NULL,
+                    baseline_policy_id TEXT NOT NULL,
+                    engine_id TEXT NOT NULL,
+                    seeds_json TEXT NOT NULL,
+                    candidate_batch_id TEXT NOT NULL REFERENCES batches(id),
+                    baseline_batch_id TEXT NOT NULL REFERENCES batches(id),
+                    gates_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
             """)
             columns = {row["name"] for row in db.execute("PRAGMA table_info(runs)")}
             if "engine_id" not in columns:
@@ -126,6 +152,160 @@ class RunStore:
         with self.connect() as db:
             rows = db.execute("SELECT * FROM runs ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
         return [self._run(row) for row in rows]
+
+    def create_batch(self, request: BatchCreate) -> Batch:
+        unique_seeds = list(dict.fromkeys(request.seeds))
+        batch_id = f"batch_{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}"
+        timestamp = now_iso()
+        with self.connect() as db:
+            db.execute("INSERT INTO batches VALUES (?, ?, ?, ?, ?, ?)",
+                       (batch_id, request.scenario_id, request.policy_id, request.engine_id,
+                        json.dumps(unique_seeds), timestamp))
+        for seed in unique_seeds:
+            run = self.create_run(RunCreate(scenario_id=request.scenario_id, policy_id=request.policy_id,
+                                            engine_id=request.engine_id, seed=seed))
+            with self.connect() as db:
+                db.execute("INSERT INTO batch_runs VALUES (?, ?, ?)", (batch_id, run.id, seed))
+        return self.get_batch(batch_id)
+
+    def get_batch(self, batch_id: str) -> Batch | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
+            if not row:
+                return None
+            run_rows = db.execute("SELECT runs.* FROM runs JOIN batch_runs ON runs.id=batch_runs.run_id WHERE batch_runs.batch_id=? ORDER BY batch_runs.seed", (batch_id,)).fetchall()
+        runs = [self._run(run_row) for run_row in run_rows]
+        counts: dict[str, int] = {}
+        for run in runs:
+            counts[run.status] = counts.get(run.status, 0) + 1
+        finished = [run for run in runs if run.status in {"succeeded", "failed", "cancelled", "interrupted"}]
+        passes = sum(run.verdict == "pass" for run in finished)
+        return Batch(id=row["id"], scenario_id=row["scenario_id"], policy_id=row["policy_id"],
+                     engine_id=row["engine_id"], seeds=json.loads(row["seeds_json"]), created_at=row["created_at"],
+                     counts=counts, pass_rate=(passes / len(finished) if finished else None), runs=runs)
+
+    def list_batches(self, limit: int = 20) -> list[Batch]:
+        with self.connect() as db:
+            ids = [row["id"] for row in db.execute("SELECT id FROM batches ORDER BY created_at DESC LIMIT ?", (limit,))]
+        return [batch for batch_id in ids if (batch := self.get_batch(batch_id)) is not None]
+
+    def cancel_batch(self, batch_id: str) -> Batch | None:
+        batch = self.get_batch(batch_id)
+        if not batch:
+            return None
+        for run in batch.runs:
+            self.request_cancel(run.id)
+        return self.get_batch(batch_id)
+
+    def create_experiment(self, request: ExperimentCreate) -> Experiment:
+        unique_seeds = list(dict.fromkeys(request.seeds))
+        baseline = self.create_batch(BatchCreate(scenario_id=request.scenario_id, policy_id=request.baseline_policy_id,
+                                                  engine_id=request.engine_id, seeds=unique_seeds))
+        candidate = self.create_batch(BatchCreate(scenario_id=request.scenario_id, policy_id=request.candidate_policy_id,
+                                                   engine_id=request.engine_id, seeds=unique_seeds))
+        experiment_id = f"exp_{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}"
+        timestamp = now_iso()
+        with self.connect() as db:
+            db.execute("INSERT INTO experiments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                       (experiment_id, request.scenario_id, request.candidate_policy_id, request.baseline_policy_id,
+                        request.engine_id, json.dumps(unique_seeds), candidate.id, baseline.id,
+                        request.gates.model_dump_json(), timestamp))
+        return self.get_experiment(experiment_id)
+
+    def get_experiment(self, experiment_id: str) -> Experiment | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM experiments WHERE id=?", (experiment_id,)).fetchone()
+        if not row:
+            return None
+        candidate = self.get_batch(row["candidate_batch_id"])
+        baseline = self.get_batch(row["baseline_batch_id"])
+        if not candidate or not baseline:
+            return None
+        seeds = json.loads(row["seeds_json"])
+        gates = GateConfig.model_validate_json(row["gates_json"])
+        candidate_by_seed = {run.seed: run for run in candidate.runs}
+        baseline_by_seed = {run.seed: run for run in baseline.runs}
+        metric_keys = ["collisions", "max_contact_force_n", "sim_duration_s", "actuator_energy_j"]
+        pairs = []
+        for seed in seeds:
+            candidate_run, baseline_run = candidate_by_seed[seed], baseline_by_seed[seed]
+            deltas = {}
+            for key in metric_keys:
+                first, second = candidate_run.metrics.get(key), baseline_run.metrics.get(key)
+                deltas[key] = float(first - second) if self._is_number(first) and self._is_number(second) else None
+            reasons = []
+            if candidate_run.status in {"failed", "cancelled", "interrupted"}:
+                checks = candidate_run.metrics.get("checks", [])
+                reasons = [check["id"] for check in checks if not check.get("passed", True)]
+                if candidate_run.error:
+                    reasons.append("policy_or_worker_error")
+                if not reasons:
+                    reasons.append(candidate_run.verdict or candidate_run.status)
+            pairs.append(SeedComparison(seed=seed, candidate_run=candidate_run, baseline_run=baseline_run,
+                                        metric_deltas=deltas, failure_reasons=reasons))
+        terminal = {"succeeded", "failed", "cancelled", "interrupted"}
+        complete = all(pair.candidate_run.status in terminal and pair.baseline_run.status in terminal for pair in pairs)
+        candidate_passes = sum(pair.candidate_run.verdict == "pass" for pair in pairs)
+        baseline_passes = sum(pair.baseline_run.verdict == "pass" for pair in pairs)
+        candidate_pass_rate = candidate_passes / len(pairs) if complete else None
+        baseline_pass_rate = baseline_passes / len(pairs) if complete else None
+
+        def mean_delta(key: str) -> float | None:
+            values = [pair.metric_deltas[key] for pair in pairs if pair.metric_deltas[key] is not None]
+            return sum(values) / len(values) if values and complete else None
+
+        summary = {
+            "candidate_pass_rate": candidate_pass_rate,
+            "baseline_pass_rate": baseline_pass_rate,
+            "pass_rate_delta": (candidate_pass_rate - baseline_pass_rate) if complete else None,
+            "mean_collision_delta": mean_delta("collisions"),
+            "mean_force_delta_n": mean_delta("max_contact_force_n"),
+            "mean_duration_delta_s": mean_delta("sim_duration_s"),
+            "mean_energy_delta_j": mean_delta("actuator_energy_j"),
+            "completed_pairs": sum(pair.candidate_run.status in terminal and pair.baseline_run.status in terminal for pair in pairs),
+            "total_pairs": len(pairs),
+        }
+        gate_results = self._gate_results(gates, summary) if complete else []
+        verdict = "pass" if complete and all(result["passed"] for result in gate_results) else "fail" if complete else "pending"
+        return Experiment(id=row["id"], scenario_id=row["scenario_id"], candidate_policy_id=row["candidate_policy_id"],
+                          baseline_policy_id=row["baseline_policy_id"], engine_id=row["engine_id"], seeds=seeds,
+                          candidate_batch_id=row["candidate_batch_id"], baseline_batch_id=row["baseline_batch_id"],
+                          gates=gates, created_at=row["created_at"], status="complete" if complete else "running",
+                          verdict=verdict, summary=summary, gate_results=gate_results, pairs=pairs)
+
+    def list_experiments(self, limit: int = 20) -> list[Experiment]:
+        with self.connect() as db:
+            ids = [row["id"] for row in db.execute("SELECT id FROM experiments ORDER BY created_at DESC LIMIT ?", (limit,))]
+        return [experiment for experiment_id in ids if (experiment := self.get_experiment(experiment_id)) is not None]
+
+    def cancel_experiment(self, experiment_id: str) -> Experiment | None:
+        experiment = self.get_experiment(experiment_id)
+        if not experiment:
+            return None
+        self.cancel_batch(experiment.candidate_batch_id)
+        self.cancel_batch(experiment.baseline_batch_id)
+        return self.get_experiment(experiment_id)
+
+    @staticmethod
+    def _is_number(value: object) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    @staticmethod
+    def _gate_results(gates: GateConfig, summary: dict) -> list[dict]:
+        definitions = [
+            ("candidate_pass_rate", summary["candidate_pass_rate"], ">=", gates.min_candidate_pass_rate,
+             summary["candidate_pass_rate"] >= gates.min_candidate_pass_rate),
+            ("pass_rate_drop", -summary["pass_rate_delta"], "<=", gates.max_pass_rate_drop,
+             -summary["pass_rate_delta"] <= gates.max_pass_rate_drop),
+            ("mean_collision_increase", summary["mean_collision_delta"], "<=", gates.max_mean_collision_increase,
+             summary["mean_collision_delta"] <= gates.max_mean_collision_increase),
+            ("mean_force_increase_n", summary["mean_force_delta_n"], "<=", gates.max_mean_force_increase_n,
+             summary["mean_force_delta_n"] <= gates.max_mean_force_increase_n),
+            ("mean_duration_increase_s", summary["mean_duration_delta_s"], "<=", gates.max_mean_duration_increase_s,
+             summary["mean_duration_delta_s"] <= gates.max_mean_duration_increase_s),
+        ]
+        return [{"id": gate_id, "actual": actual, "operator": operator, "limit": limit, "passed": passed}
+                for gate_id, actual, operator, limit, passed in definitions]
 
     def get_run(self, run_id: str) -> Run | None:
         with self.connect() as db:

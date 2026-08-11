@@ -94,3 +94,20 @@ export interface PolicyAction {
 export interface PolicyStep {
   sequence: number; observation: PolicyObservation; action: PolicyAction; decision_ms: number;
 }
+
+export interface Batch {
+  id: string; scenario_id: string; policy_id: string; engine_id: string; seeds: number[];
+  created_at: string; counts: Record<string, number>; pass_rate: number | null; runs: Run[];
+}
+
+export interface GateResult { id: string; actual: number; operator: string; limit: number; passed: boolean; }
+export interface SeedComparison {
+  seed: number; candidate_run: Run; baseline_run: Run;
+  metric_deltas: Record<string, number | null>; failure_reasons: string[];
+}
+export interface Experiment {
+  id: string; scenario_id: string; candidate_policy_id: string; baseline_policy_id: string; engine_id: string;
+  seeds: number[]; candidate_batch_id: string; baseline_batch_id: string; created_at: string;
+  status: "running" | "complete"; verdict: "pending" | "pass" | "fail";
+  summary: Record<string, number | null>; gate_results: GateResult[]; pairs: SeedComparison[];
+}

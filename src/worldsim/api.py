@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import Settings
-from .contracts import EvidenceVerification, Health, MetricComparison, PolicyStep, Run, RunComparison, RunCreate, RunDetail, ScenarioResponse
+from .contracts import Batch, BatchCreate, EvidenceVerification, Experiment, ExperimentCreate, Health, MetricComparison, PolicyStep, Run, RunComparison, RunCreate, RunDetail, ScenarioResponse
 from .evidence import verify_evidence_bundle
+from .exports import experiment_csv, experiment_junit
 from .scenario import load_scenario
 from .store import RunStore
 
@@ -34,6 +35,76 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/runs", response_model=list[Run])
     def list_runs() -> list[Run]:
         return store.list_runs()
+
+    @app.get("/api/batches", response_model=list[Batch])
+    def list_batches() -> list[Batch]:
+        return store.list_batches()
+
+    @app.post("/api/batches", response_model=Batch, status_code=202)
+    def create_batch(request: BatchCreate) -> Batch:
+        if request.scenario_id != "warehouse_v0":
+            raise HTTPException(422, "Only warehouse_v0 is installed")
+        if request.engine_id == "deterministic_mock_v1" and request.policy_id not in {"baseline_safe", "baseline_risky"}:
+            raise HTTPException(422, "External policies require the MuJoCo engine")
+        return store.create_batch(request)
+
+    @app.get("/api/batches/{batch_id}", response_model=Batch)
+    def get_batch(batch_id: str) -> Batch:
+        batch = store.get_batch(batch_id)
+        if not batch:
+            raise HTTPException(404, "Batch not found")
+        return batch
+
+    @app.post("/api/batches/{batch_id}/cancel", response_model=Batch)
+    def cancel_batch(batch_id: str) -> Batch:
+        batch = store.cancel_batch(batch_id)
+        if not batch:
+            raise HTTPException(404, "Batch not found")
+        return batch
+
+    @app.get("/api/experiments", response_model=list[Experiment])
+    def list_experiments() -> list[Experiment]:
+        return store.list_experiments()
+
+    @app.post("/api/experiments", response_model=Experiment, status_code=202)
+    def create_experiment(request: ExperimentCreate) -> Experiment:
+        if request.scenario_id != "warehouse_v0":
+            raise HTTPException(422, "Only warehouse_v0 is installed")
+        if request.engine_id == "deterministic_mock_v1":
+            allowed = {"baseline_safe", "baseline_risky"}
+            if request.candidate_policy_id not in allowed or request.baseline_policy_id not in allowed:
+                raise HTTPException(422, "External policies require the MuJoCo engine")
+        return store.create_experiment(request)
+
+    @app.get("/api/experiments/{experiment_id}", response_model=Experiment)
+    def get_experiment(experiment_id: str) -> Experiment:
+        experiment = store.get_experiment(experiment_id)
+        if not experiment:
+            raise HTTPException(404, "Experiment not found")
+        return experiment
+
+    @app.post("/api/experiments/{experiment_id}/cancel", response_model=Experiment)
+    def cancel_experiment(experiment_id: str) -> Experiment:
+        experiment = store.cancel_experiment(experiment_id)
+        if not experiment:
+            raise HTTPException(404, "Experiment not found")
+        return experiment
+
+    @app.get("/api/experiments/{experiment_id}/export")
+    def export_experiment(experiment_id: str, format: str = "json") -> Response:
+        experiment = store.get_experiment(experiment_id)
+        if not experiment:
+            raise HTTPException(404, "Experiment not found")
+        if format == "json":
+            content, media_type, extension = experiment.model_dump_json(indent=2), "application/json", "json"
+        elif format == "csv":
+            content, media_type, extension = experiment_csv(experiment), "text/csv", "csv"
+        elif format == "junit":
+            content, media_type, extension = experiment_junit(experiment), "application/xml", "xml"
+        else:
+            raise HTTPException(422, "format must be json, csv, or junit")
+        return Response(content=content, media_type=media_type,
+                        headers={"Content-Disposition": f'attachment; filename="{experiment.id}.{extension}"'})
 
     @app.post("/api/runs", response_model=Run, status_code=202)
     def create_run(request: RunCreate) -> Run:

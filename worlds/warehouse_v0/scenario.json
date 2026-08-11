@@ -20,6 +20,11 @@
     "delivery_zone": [86, 20],
     "timeout_s": 30
   },
+  "policy": {
+    "control_hz": 10,
+    "decision_timeout_ms": 100,
+    "protocol_version": "1.0"
+  },
   "variation": {
     "package_jitter_m": 3,
     "obstruction_jitter_m": 2,

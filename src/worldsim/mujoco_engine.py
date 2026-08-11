@@ -13,7 +13,8 @@ from .contracts import Frame, PolicyAction, PolicyObservation, Run
 from .engines import EngineCapabilities
 from .evaluator import evaluate
 from .evidence import write_evidence_bundle
-from .policy import EpisodeContext, load_policy
+from .policy import EpisodeContext
+from .policy_runtime import IsolatedPolicyClient, PolicyRuntimeError, PROTOCOL_VERSION
 from .scenario import load_scenario
 from .store import RunStore
 
@@ -133,8 +134,9 @@ class MujocoEngine:
         dof_addresses = {name: model.jnt_dofadr[joint_id] for name, joint_id in joint_ids.items()}
         spawn = tuple(scenario["agent"]["spawn"])
         goal = tuple(scenario["task"]["delivery_zone"])
-        policy = load_policy(run.policy_id)
-        policy.reset(EpisodeContext(scenario=scenario))
+        decision_timeout_ms = int(scenario["policy"]["decision_timeout_ms"])
+        policy = IsolatedPolicyClient(run.policy_id, EpisodeContext(scenario=scenario), timeout_ms=decision_timeout_ms)
+        policy.start()
         package_geom = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "package_geom")
         finger_geoms = {
             mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "robot_left_finger"),
@@ -154,6 +156,7 @@ class MujocoEngine:
         previous_force = 0.0
         decision_times: list[float] = []
         cancelled = False
+        policy_error: str | None = None
         store.update_run(run.id, status="running", progress=.08, phase="Executing rigid-body episode")
 
         for sequence in range(max_steps):
@@ -173,7 +176,13 @@ class MujocoEngine:
                 contact_force_n=previous_force,
             )
             decision_started = perf_counter()
-            action = PolicyAction.model_validate(policy.act(observation))
+            try:
+                action = policy.act(observation)
+            except PolicyRuntimeError as exc:
+                decision_ms = (perf_counter() - decision_started) * 1000
+                policy_error = str(exc)
+                store.append_event(run.id, "policy_error", policy_error, sequence * .1)
+                break
             decision_ms = (perf_counter() - decision_started) * 1000
             decision_times.append(decision_ms)
             store.add_policy_step(run.id, sequence, observation.model_dump(), action.model_dump(), decision_ms)
@@ -251,7 +260,8 @@ class MujocoEngine:
                              phase="Delivering qualified grasp" if grasp_qualified else "Policy controlling robot")
             time.sleep(frame_delay)
 
-        if not frames and cancelled:
+        policy.close()
+        if not frames and (cancelled or policy_error):
             package_position = data.xpos[package_body]
             robot_position = data.xpos[robot_body]
             frame = Frame(sequence=0, sim_time=0, robot_x=float(robot_position[0]), robot_y=float(robot_position[1]),
@@ -271,12 +281,15 @@ class MujocoEngine:
                    "collision_geometries": collision_geometries,
                    "max_contact_force_n": round(max_force, 3), "sim_duration_s": frames[-1]["sim_time"],
                    "frames_recorded": len(frames), "physics_steps": len(frames) * 5,
+                   "actuator_energy_j": frames[-1].get("energy_j"),
                    "measured_contact_samples": measured_samples, "deterministic_seed": run.seed,
                    "grasp_qualified": grasp_qualified, "grasp_finger_contacts": len(finger_contacts),
                    "policy_steps": len(policy_trace),
+                   "policy_isolated": True, "policy_protocol_version": PROTOCOL_VERSION,
+                   "policy_decision_timeout_ms": decision_timeout_ms,
                    "policy_decision_mean_ms": round(sum(decision_times) / len(decision_times), 4) if decision_times else 0,
                    "policy_decision_max_ms": round(max(decision_times), 4) if decision_times else 0}
-        verdict, checks = ("cancelled", []) if cancelled else evaluate(metrics, scenario)
+        verdict, checks = ("cancelled", []) if cancelled else ("error", []) if policy_error else evaluate(metrics, scenario)
         metrics["checks"] = checks
         if not cancelled:
             store.update_run(run.id, status="finalizing", progress=.96, phase="Writing physics evidence")
@@ -292,5 +305,6 @@ class MujocoEngine:
         store.append_event(run.id, "verdict", f"Physics run {verdict.upper()}", frames[-1]["sim_time"])
         final_status = "cancelled" if cancelled else "succeeded" if verdict == "pass" else "failed"
         store.update_run(run.id, status=final_status, progress=1,
-                         phase="Cancelled with partial evidence" if cancelled else "Physics evaluation complete", verdict=verdict, metrics=metrics)
+                         phase="Cancelled with partial evidence" if cancelled else "Policy execution failed" if policy_error else "Physics evaluation complete",
+                         verdict=verdict, metrics=metrics, error=policy_error)
         return evidence

@@ -1,7 +1,8 @@
 import { lazy, Suspense, useEffect, useMemo, useState } from "react";
-import type { Comparison, EngineInfo, EvidenceVerification, PolicyStep, Run, Scenario } from "./types";
+import type { Batch, Comparison, EngineInfo, EvidenceVerification, Experiment, PolicyStep, Run, Scenario } from "./types";
 import Telemetry from "./Telemetry";
 import PolicyTrace from "./PolicyTrace";
+import ExperimentPanel from "./ExperimentPanel";
 
 const WorldView3D = lazy(() => import("./WorldView3D"));
 
@@ -24,6 +25,8 @@ interface Check {
 
 export default function App() {
   const [runs, setRuns] = useState<Run[]>([]);
+  const [batches, setBatches] = useState<Batch[]>([]);
+  const [experiments, setExperiments] = useState<Experiment[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<Run | null>(null);
   const [scenario, setScenario] = useState<Scenario>();
@@ -31,6 +34,8 @@ export default function App() {
   const [engineId, setEngineId] = useState("mujoco_v1");
   const [policy, setPolicy] = useState("baseline_safe");
   const [seed, setSeed] = useState(42);
+  const [batchSeeds, setBatchSeeds] = useState("1, 2, 3, 4, 5");
+  const [baselinePolicy, setBaselinePolicy] = useState("baseline_safe");
   const [cursor, setCursor] = useState(0);
   const [followLive, setFollowLive] = useState(true);
   const [compareId, setCompareId] = useState("");
@@ -41,8 +46,8 @@ export default function App() {
 
   const refresh = async () => {
     try {
-      const nextRuns = await api<Run[]>("/api/runs");
-      setRuns(nextRuns); setError(null);
+      const [nextRuns, nextBatches, nextExperiments] = await Promise.all([api<Run[]>("/api/runs"), api<Batch[]>("/api/batches"), api<Experiment[]>("/api/experiments")]);
+      setRuns(nextRuns); setBatches(nextBatches); setExperiments(nextExperiments); setError(null);
       if (!selectedId && nextRuns.length) setSelectedId(nextRuns[0].id);
       if (selectedId) {
         const nextDetail = await api<Run>(`/api/runs/${selectedId}`);
@@ -83,6 +88,26 @@ export default function App() {
     try { const cancelled = await api<Run>(`/api/runs/${detail.id}/cancel`, { method: "POST" }); setDetail(current => current ? { ...current, ...cancelled } : current); }
     catch (reason) { setError(reason instanceof Error ? reason.message : "Could not cancel run"); }
   };
+  const startBatch = async () => {
+    const seeds = [...new Set(batchSeeds.split(",").map(value => Number(value.trim())).filter(value => Number.isInteger(value) && value >= 0))];
+    if (!seeds.length || seeds.length > 50) { setError("Enter between 1 and 50 comma-separated integer seeds"); return; }
+    try {
+      const batch = await api<Batch>("/api/batches", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ scenario_id: "warehouse_v0", policy_id: policy, engine_id: engineId, seeds }) });
+      setBatches(current => [batch, ...current]); if (batch.runs.length) setSelectedId(batch.runs[0].id); setError(null);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "Could not start batch"); }
+  };
+  const startExperiment = async () => {
+    const seeds = [...new Set(batchSeeds.split(",").map(value => Number(value.trim())).filter(value => Number.isInteger(value) && value >= 0))];
+    if (!seeds.length || seeds.length > 50) { setError("Enter between 1 and 50 comma-separated integer seeds"); return; }
+    try {
+      const experiment = await api<Experiment>("/api/experiments", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ scenario_id: "warehouse_v0", candidate_policy_id: policy, baseline_policy_id: baselinePolicy, engine_id: engineId, seeds }) });
+      setExperiments(current => [experiment, ...current]); setError(null);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "Could not start experiment"); }
+  };
+  const cancelExperiment = async (id: string) => {
+    try { const experiment = await api<Experiment>(`/api/experiments/${id}/cancel`, { method: "POST" }); setExperiments(current => current.map(item => item.id === id ? experiment : item)); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : "Could not cancel experiment"); }
+  };
 
   const frames = detail?.frames ?? [];
   const frame = frames[Math.min(cursor, Math.max(0, frames.length - 1))];
@@ -107,6 +132,10 @@ export default function App() {
         <div className="launch-card"><label className="engine-select">Engine<select value={engineId} onChange={event => setEngineId(event.target.value)}>{engines.length ? engines.map(engine => <option key={engine.id} value={engine.id} disabled={!engine.available}>{engine.name}{engine.physics ? " · PHYSICS" : " · SYNTHETIC"}{!engine.available ? " · NOT INSTALLED" : ""}</option>) : <option value="mujoco_v1">MuJoCo 3.11 · PHYSICS</option>}</select></label><label>Policy<input list="policy-options" value={policy} onChange={event => setPolicy(event.target.value)} /><datalist id="policy-options"><option value="baseline_safe"/><option value="baseline_risky"/><option value="python:examples.policies.hold_position:HoldPositionPolicy"/></datalist></label><label>Seed<input type="number" min="0" value={seed} onChange={event => setSeed(Number(event.target.value))} /></label><button onClick={startRun}>Run simulation <span>→</span></button></div>
       </section>
       {error && <div className="error"><strong>Runtime unavailable.</strong> {error}. Keep <code>npm run dev</code> open and reload.</div>}
+      <section className="batch-bar"><div><p className="eyebrow">BENCHMARK BATCH</p><strong>Evaluate this policy across deterministic seeds</strong></div><label>Seeds<input value={batchSeeds} onChange={event => setBatchSeeds(event.target.value)} placeholder="1, 2, 3, 4, 5" /></label><button onClick={startBatch}>Run batch</button></section>
+      <section className="experiment-launch"><div><p className="eyebrow">REGRESSION EXPERIMENT</p><strong>Compare the selected candidate against a locked baseline</strong></div><label>Baseline<input list="policy-options" value={baselinePolicy} onChange={event => setBaselinePolicy(event.target.value)} /></label><button onClick={startExperiment}>Compare policies</button></section>
+      {batches.length > 0 && <section className="batch-list">{batches.slice(0, 3).map(batch => { const completed = (batch.counts.succeeded ?? 0) + (batch.counts.failed ?? 0) + (batch.counts.cancelled ?? 0); return <div key={batch.id}><button onClick={() => batch.runs[0] && setSelectedId(batch.runs[0].id)}><span>{batch.policy_id}</span><small>{batch.seeds.length} SEEDS · {completed}/{batch.runs.length} COMPLETE</small></button><div className="batch-progress"><i style={{ width: `${batch.runs.length ? completed / batch.runs.length * 100 : 0}%` }} /></div><strong>{batch.pass_rate === null ? "RUNNING" : `${Math.round(batch.pass_rate * 100)}% PASS`}</strong></div>; })}</section>}
+      {experiments[0] && <ExperimentPanel experiment={experiments[0]} selectRun={setSelectedId} cancel={() => cancelExperiment(experiments[0].id)} />}
 
       <section className="lab-grid">
         <aside className="runs-panel"><div className="section-title"><span>Recent runs</span><small>{runs.length} recorded</small></div><div className="run-list">{runs.length ? runs.map(run => <button key={run.id} className={`run-row ${selectedId === run.id ? "selected" : ""}`} onClick={() => setSelectedId(run.id)}><div><Status run={run} /><strong>{run.policy_id.replace("baseline_", "")}</strong></div><small>{run.engine_id === "mujoco_v1" ? "PHYSICS" : "SYNTHETIC"} · {run.id.slice(-8)} · seed {run.seed}</small></button>) : <p className="empty">No simulations yet.</p>}</div></aside>
