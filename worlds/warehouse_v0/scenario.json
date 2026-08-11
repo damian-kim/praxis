@@ -1,0 +1,43 @@
+{
+  "schema_version": "1.1",
+  "id": "warehouse_v0",
+  "name": "Obstructed warehouse delivery",
+  "world": {
+    "width_m": 100,
+    "height_m": 100,
+    "gravity_m_s2": 9.81,
+    "floor_friction": 0.72
+  },
+  "agent": {
+    "type": "mobile_manipulator",
+    "spawn": [10, 78],
+    "mass_kg": 118
+  },
+  "task": {
+    "objective": "Clear the aisle, collect the package, and deliver it to the outbound bay",
+    "package_spawn": [68, 32],
+    "obstruction": { "position": [47, 52], "size": [12, 5, 3], "rotation_deg": -18 },
+    "delivery_zone": [86, 20],
+    "timeout_s": 30
+  },
+  "variation": {
+    "package_jitter_m": 3,
+    "obstruction_jitter_m": 2,
+    "obstruction_rotation_deg": 12
+  },
+  "layout": {
+    "shelves": [
+      { "position": [21, 29], "size": [8, 35, 8] },
+      { "position": [40, 24], "size": [8, 28, 8] },
+      { "position": [60, 21], "size": [8, 22, 8] },
+      { "position": [21, 73], "size": [8, 26, 8] },
+      { "position": [47, 75.5], "size": [8, 23, 8] }
+    ]
+  },
+  "limits": {
+    "max_collisions": { "value": 0, "unit": "count", "source": "benchmark_policy_v0", "calibration_status": "provisional", "rationale": "Any rigid shelf impact invalidates a nominal warehouse delivery." },
+    "max_contact_force_n": { "value": 100, "unit": "N", "source": "development_safety_profile_v0", "calibration_status": "synthetic", "rationale": "Development guardrail pending robot- and payload-specific calibration." },
+    "must_complete": { "value": true, "unit": "boolean", "source": "task_contract", "calibration_status": "defined", "rationale": "The package must enter the outbound zone before timeout." },
+    "max_duration_s": { "value": 30, "unit": "s", "source": "task_contract", "calibration_status": "provisional", "rationale": "Initial service-level target for the reference route." }
+  }
+}

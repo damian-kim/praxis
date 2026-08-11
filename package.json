@@ -1,0 +1,13 @@
+{
+  "name": "worldsim-local",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "setup": "python -m pip install -e .[dev,physics] && npm --prefix apps/web install",
+    "dev": "python scripts/dev.py",
+    "api": "python -m uvicorn worldsim.api:app --host 127.0.0.1 --port 8010",
+    "worker": "python -m worldsim.worker",
+    "web": "npm --prefix apps/web run dev",
+    "test": "python -m pytest"
+  }
+}
