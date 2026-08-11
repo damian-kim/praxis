@@ -38,6 +38,7 @@
     "max_collisions": { "value": 0, "unit": "count", "source": "benchmark_policy_v0", "calibration_status": "provisional", "rationale": "Any rigid shelf impact invalidates a nominal warehouse delivery." },
     "max_contact_force_n": { "value": 100, "unit": "N", "source": "development_safety_profile_v0", "calibration_status": "synthetic", "rationale": "Development guardrail pending robot- and payload-specific calibration." },
     "must_complete": { "value": true, "unit": "boolean", "source": "task_contract", "calibration_status": "defined", "rationale": "The package must enter the outbound zone before timeout." },
-    "max_duration_s": { "value": 30, "unit": "s", "source": "task_contract", "calibration_status": "provisional", "rationale": "Initial service-level target for the reference route." }
+    "max_duration_s": { "value": 30, "unit": "s", "source": "task_contract", "calibration_status": "provisional", "rationale": "Initial service-level target for the reference route." },
+    "must_qualify_grasp": { "value": true, "unit": "boolean", "source": "task_contract_v1", "calibration_status": "defined", "rationale": "Delivery only counts after both gripper fingers physically contact the package." }
   }
 }

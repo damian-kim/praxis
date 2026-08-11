@@ -38,8 +38,13 @@ def execute_mock_run(store: RunStore, run: Run, evidence_root: Path, frame_delay
     max_force = 0.0
     collisions = 0
     frames: list[dict] = []
+    cancelled = False
     trajectory = list(interpolate(waypoints))
     for sequence, (leg, x, y) in enumerate(trajectory):
+        if store.is_cancel_requested(run.id):
+            cancelled = True
+            store.append_event(run.id, "lifecycle", "Mock worker acknowledged cancellation", sequence * .1)
+            break
         next_index = min(sequence + 1, len(trajectory) - 1)
         _, nx, ny = trajectory[next_index]
         heading = math.atan2(ny - y, nx - x)
@@ -72,18 +77,25 @@ def execute_mock_run(store: RunStore, run: Run, evidence_root: Path, frame_delay
                          phase=["Navigating", "Clearing obstruction", "Approaching package", "Delivering package"][min(leg, 3)])
         time.sleep(frame_delay)
 
+    if not frames:
+        frame = Frame(sequence=0, sim_time=0, robot_x=waypoints[0][0], robot_y=waypoints[0][1], heading=0,
+                      package_x=package[0], package_y=package[1], carrying=False, contact_force=0)
+        store.add_frame(run.id, frame)
+        frames.append(frame.model_dump())
     metrics = {
-        "task_completed": True,
+        "task_completed": not cancelled,
+        "grasp_qualified": not cancelled,
         "collisions": collisions,
         "max_contact_force_n": max_force,
         "sim_duration_s": frames[-1]["sim_time"],
         "frames_recorded": len(frames),
         "deterministic_seed": run.seed,
     }
-    verdict, checks = evaluate(metrics, scenario)
+    verdict, checks = ("cancelled", []) if cancelled else evaluate(metrics, scenario)
     failed = verdict == "fail"
     metrics["checks"] = checks
-    store.update_run(run.id, status="finalizing", progress=0.96, phase="Writing immutable evidence")
+    if not cancelled:
+        store.update_run(run.id, status="finalizing", progress=0.96, phase="Writing immutable evidence")
     run_dir = evidence_root / "runs" / run.id
     run_dir.mkdir(parents=True, exist_ok=True)
     evidence = {
@@ -101,6 +113,6 @@ def execute_mock_run(store: RunStore, run: Run, evidence_root: Path, frame_delay
     }
     write_evidence_bundle(run_dir, evidence)
     store.add_event(run.id, event_sequence, "verdict", f"Run {verdict.upper()}", frames[-1]["sim_time"])
-    store.update_run(run.id, status="failed" if failed else "succeeded", progress=1.0,
-                     phase="Evaluation complete", verdict=verdict, metrics=metrics)
+    store.update_run(run.id, status="cancelled" if cancelled else "failed" if failed else "succeeded", progress=1.0,
+                     phase="Cancelled with partial evidence" if cancelled else "Evaluation complete", verdict=verdict, metrics=metrics)
     return evidence

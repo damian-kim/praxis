@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["httpx>=0.28", "pytest>=8.3"]
+dev = ["httpx2>=2.10", "pytest>=8.3"]
 physics = ["mujoco==3.11.0"]
 
 [tool.setuptools.packages.find]

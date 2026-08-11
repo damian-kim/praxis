@@ -1,6 +1,6 @@
-# WorldSim
+# Praxis Worlds
 
-WorldSim is a development test lab for embodied agents. Its first world is a warehouse task where a mobile manipulator navigates an obstructed aisle, collects a package, and delivers it while the system records motion, contacts, task events, metrics, and a replayable evidence trail.
+Praxis Worlds is a development test lab for embodied agents. Its first world is a warehouse task where a mobile manipulator navigates an obstructed aisle, qualifies a physical grasp, and delivers a package while the system records policy decisions, motion, contacts, task events, metrics, and replayable evidence.
 
 The default backend is MuJoCo 3.11 and executes native rigid-body dynamics and contacts. A deterministic mock remains available for fast product development. The current physics validity envelope covers simplified warehouse navigation contacts; locomotion and package attachment are not yet high-fidelity robotics models. NVIDIA Isaac Sim/PhysX remains a later adapter target.
 
@@ -27,6 +27,8 @@ The first command installs the editable Python package and web dependencies. Lat
 - Compare two completed runs to inspect metric deltas.
 - Inspect synchronized base speed, yaw rate, arm joints, gripper aperture, contact force, and actuator energy.
 - Confirm the SHA-256 evidence badge after a run completes.
+- Enter a built-in or `python:module:object` policy and inspect every observation and action.
+- Cancel an active run and retain its partial, verifiable replay.
 - Restart the app; previous runs remain available because they are stored in `.worldsim/worldsim.db`.
 - Inspect immutable evidence in `.worldsim/runs/<run-id>/evidence.json`.
 
@@ -50,6 +52,7 @@ src/worldsim/mujoco_engine.py   Native rigid-body/contact adapter
 src/worldsim/engines.py         Shared simulation-engine boundary
 src/worldsim/evaluator.py       Limits, decisions, and provenance
 src/worldsim/evidence.py        SHA-256 bundle writing and verification
+src/worldsim/policy.py          Python policy contract, loader, and references
 src/worldsim/store.py           SQLite queue, state, frames, and events
 worlds/warehouse_v0/            Versioned scenario contract
 docs/prds/                      Reviewable sprint specifications
@@ -57,4 +60,4 @@ docs/architecture-decisions/    Important technical decisions
 tests/                           End-to-end vertical-slice tests
 ```
 
-Review [Sprint 1](docs/prds/001-durable-world-test-lab.md), [Sprint 2](docs/prds/002-engine-neutral-3d-evaluation.md), [Sprint 3](docs/prds/003-mujoco-physics-adapter.md), and [Sprint 4](docs/prds/004-articulated-telemetry-and-integrity.md) for goals, designs, acceptance criteria, risks, and validity boundaries.
+Review [Sprint 1](docs/prds/001-durable-world-test-lab.md), [Sprint 2](docs/prds/002-engine-neutral-3d-evaluation.md), [Sprint 3](docs/prds/003-mujoco-physics-adapter.md), [Sprint 4](docs/prds/004-articulated-telemetry-and-integrity.md), and [Sprint 5](docs/prds/005-policy-sdk-and-qualified-grasp.md) for goals, designs, acceptance criteria, risks, and validity boundaries. See the [Python Policy SDK](docs/sdk/python-policy.md) to connect an external policy.

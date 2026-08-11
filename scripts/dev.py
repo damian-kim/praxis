@@ -31,7 +31,7 @@ def main() -> int:
             process = subprocess.Popen(command, cwd=ROOT, env=environment, creationflags=creation_flags)
             processes.append((name, process))
             print(f"Started {name} (pid {process.pid})")
-        print("\nWorldSim Lab: http://127.0.0.1:5173")
+        print("\nPraxis Lab:   http://127.0.0.1:5173")
         print("API docs:     http://127.0.0.1:8010/docs\n")
         while True:
             for name, process in processes:
@@ -41,7 +41,7 @@ def main() -> int:
                     return exit_code or 1
             time.sleep(0.5)
     except KeyboardInterrupt:
-        print("\nStopping WorldSim...")
+        print("\nStopping Praxis Worlds...")
         return 0
     finally:
         for _, process in processes:

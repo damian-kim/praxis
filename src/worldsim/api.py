@@ -6,7 +6,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import Settings
-from .contracts import EvidenceVerification, Health, MetricComparison, Run, RunComparison, RunCreate, RunDetail, ScenarioResponse
+from .contracts import EvidenceVerification, Health, MetricComparison, PolicyStep, Run, RunComparison, RunCreate, RunDetail, ScenarioResponse
 from .evidence import verify_evidence_bundle
 from .scenario import load_scenario
 from .store import RunStore
@@ -15,7 +15,7 @@ from .store import RunStore
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     store = RunStore(settings.db_path)
-    app = FastAPI(title="WorldSim API", version="0.1.0")
+    app = FastAPI(title="Praxis Worlds API", version="0.5.0")
     app.state.settings = settings
     app.state.store = store
     app.add_middleware(
@@ -39,6 +39,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def create_run(request: RunCreate) -> Run:
         if request.scenario_id != "warehouse_v0":
             raise HTTPException(422, "Only warehouse_v0 is installed")
+        if request.engine_id == "deterministic_mock_v1" and request.policy_id not in {"baseline_safe", "baseline_risky"}:
+            raise HTTPException(422, "External policies require the MuJoCo engine")
         return store.create_run(request)
 
     @app.get("/api/engines")
@@ -60,6 +62,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(404, "Run not found")
         return run
 
+    @app.post("/api/runs/{run_id}/cancel", response_model=Run)
+    def cancel_run(run_id: str) -> Run:
+        run = store.request_cancel(run_id)
+        if not run:
+            raise HTTPException(404, "Run not found")
+        return run
+
+    @app.get("/api/runs/{run_id}/policy-trace", response_model=list[PolicyStep])
+    def policy_trace(run_id: str) -> list[PolicyStep]:
+        if not store.get_run(run_id):
+            raise HTTPException(404, "Run not found")
+        return [PolicyStep(**step) for step in store.get_policy_steps(run_id)]
+
     @app.get("/api/runs/{run_id}/evidence/verify", response_model=EvidenceVerification)
     def verify_run_evidence(run_id: str) -> EvidenceVerification:
         if not store.get_run(run_id):
@@ -78,7 +93,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         primary, comparison = store.get_run(run_id), store.get_run(comparison_id)
         if not primary or not comparison:
             raise HTTPException(404, "Run not found")
-        keys = ["task_completed", "collisions", "max_contact_force_n", "sim_duration_s"]
+        keys = ["task_completed", "grasp_qualified", "collisions", "max_contact_force_n", "sim_duration_s"]
         metrics = []
         for key in keys:
             first, second = primary.metrics.get(key), comparison.metrics.get(key)

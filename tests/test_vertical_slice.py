@@ -12,6 +12,8 @@ from worldsim.contracts import RunCreate
 from worldsim.simulator import execute_mock_run
 from worldsim.scenario import load_scenario
 from worldsim.evidence import verify_evidence_bundle
+from worldsim.policy import EpisodeContext, load_policy
+from worldsim.contracts import PolicyObservation
 from worldsim.store import RunStore
 
 
@@ -130,7 +132,7 @@ def test_mujoco_engine_records_real_contact_evidence(tmp_path: Path) -> None:
     assert evidence["trajectory"][-1]["energy_j"] > 0
     assert evidence["trajectory"][-1]["shoulder_angle_rad"] is not None
     valid, checked, errors = verify_evidence_bundle(tmp_path / "runs" / claimed.id)
-    assert valid is True and checked == 2 and errors == []
+    assert valid is True and checked == 3 and errors == []
 
 
 def test_evidence_verifier_detects_tampering(tmp_path: Path) -> None:
@@ -163,3 +165,44 @@ def test_existing_frame_database_migrates_without_data_loss(tmp_path: Path) -> N
     assert "energy_j" in columns
     assert "shoulder_angle_rad" in columns
     assert count == 1
+
+
+def test_external_python_policy_contract_loads() -> None:
+    scenario = load_scenario(Path(__file__).resolve().parents[1] / "worlds" / "warehouse_v0" / "scenario.json", 1)
+    policy = load_policy("python:examples.policies.hold_position:HoldPositionPolicy")
+    policy.reset(EpisodeContext(scenario=scenario))
+    observation = PolicyObservation(step=0, sim_time=0, robot_x=1, robot_y=2, heading=0,
+                                    linear_speed_m_s=0, angular_speed_rad_s=0, package_x=3, package_y=4,
+                                    goal_x=5, goal_y=6, carrying=False, grasp_qualified=False, contact_force_n=0)
+    action = policy.act(observation)
+    assert action.target_x == 1
+    assert action.target_y == 2
+
+
+def test_active_run_cancellation_writes_partial_verified_evidence(tmp_path: Path) -> None:
+    from worldsim.mujoco_engine import MujocoEngine
+
+    settings = settings_for(tmp_path)
+    store = RunStore(settings.db_path)
+    store.create_run(RunCreate(policy_id="baseline_safe", engine_id="mujoco_v1", seed=8))
+    claimed = store.claim_next()
+    assert claimed
+    cancelled = store.request_cancel(claimed.id)
+    assert cancelled and cancelled.status == "cancelling"
+
+    evidence = MujocoEngine(settings.scenario_path).execute(store, claimed, tmp_path, frame_delay=0)
+    final = store.get_run(claimed.id)
+
+    assert evidence["verdict"] == "cancelled"
+    assert final and final.status == "cancelled"
+    assert len(store.get_detail(claimed.id).frames) == 1
+    assert verify_evidence_bundle(tmp_path / "runs" / claimed.id)[0] is True
+
+
+def test_queued_run_can_be_cancelled_without_worker(tmp_path: Path) -> None:
+    store = RunStore(settings_for(tmp_path).db_path)
+    run = store.create_run(RunCreate())
+    cancelled = store.request_cancel(run.id)
+
+    assert cancelled and cancelled.status == "cancelled"
+    assert store.claim_next() is None

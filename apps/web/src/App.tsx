@@ -1,10 +1,11 @@
 import { lazy, Suspense, useEffect, useMemo, useState } from "react";
-import type { Comparison, EngineInfo, EvidenceVerification, Run, Scenario } from "./types";
+import type { Comparison, EngineInfo, EvidenceVerification, PolicyStep, Run, Scenario } from "./types";
 import Telemetry from "./Telemetry";
+import PolicyTrace from "./PolicyTrace";
 
 const WorldView3D = lazy(() => import("./WorldView3D"));
 
-const activeStatuses = new Set(["queued", "provisioning", "loading", "running", "finalizing"]);
+const activeStatuses = new Set(["queued", "provisioning", "loading", "running", "cancelling", "finalizing"]);
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(path, options);
@@ -35,6 +36,7 @@ export default function App() {
   const [compareId, setCompareId] = useState("");
   const [comparison, setComparison] = useState<Comparison>();
   const [verification, setVerification] = useState<EvidenceVerification>();
+  const [policySteps, setPolicySteps] = useState<PolicyStep[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = async () => {
@@ -52,7 +54,7 @@ export default function App() {
 
   useEffect(() => { refresh(); const timer = window.setInterval(refresh, 500); return () => window.clearInterval(timer); }, [selectedId, followLive]);
   useEffect(() => { api<EngineInfo[]>("/api/engines").then(setEngines).catch(() => setEngines([])); }, []);
-  useEffect(() => { if (selectedId) { setDetail(null); setCursor(0); setFollowLive(true); setCompareId(""); setComparison(undefined); setVerification(undefined); } }, [selectedId]);
+  useEffect(() => { if (selectedId) { setDetail(null); setCursor(0); setFollowLive(true); setCompareId(""); setComparison(undefined); setVerification(undefined); setPolicySteps([]); } }, [selectedId]);
   useEffect(() => {
     if (!detail) return;
     api<{ definition: Scenario }>(`/api/scenarios/${detail.scenario_id}?seed=${detail.seed}`).then(result => setScenario(result.definition)).catch(() => setScenario(undefined));
@@ -65,12 +67,21 @@ export default function App() {
     if (!detail || activeStatuses.has(detail.status)) { setVerification(undefined); return; }
     api<EvidenceVerification>(`/api/runs/${detail.id}/evidence/verify`).then(setVerification).catch(() => setVerification(undefined));
   }, [detail?.id, detail?.status]);
+  useEffect(() => {
+    if (!detail) return;
+    api<PolicyStep[]>(`/api/runs/${detail.id}/policy-trace`).then(setPolicySteps).catch(() => setPolicySteps([]));
+  }, [detail?.id, detail?.updated_at]);
 
   const startRun = async () => {
     try {
       const created = await api<Run>("/api/runs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ scenario_id: "warehouse_v0", policy_id: policy, engine_id: engineId, seed }) });
       setSelectedId(created.id); setError(null);
     } catch (reason) { setError(reason instanceof Error ? reason.message : "Could not start run"); }
+  };
+  const cancelRun = async () => {
+    if (!detail) return;
+    try { const cancelled = await api<Run>(`/api/runs/${detail.id}/cancel`, { method: "POST" }); setDetail(current => current ? { ...current, ...cancelled } : current); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : "Could not cancel run"); }
   };
 
   const frames = detail?.frames ?? [];
@@ -81,6 +92,7 @@ export default function App() {
   const checks = Array.isArray(detail?.metrics.checks) ? detail.metrics.checks as Check[] : [];
   const metricCards = useMemo(() => detail ? [
     ["Completion", detail.metrics.task_completed === undefined ? "—" : detail.metrics.task_completed ? "Yes" : "No"],
+    ["Grasp", detail.metrics.grasp_qualified === undefined ? "—" : detail.metrics.grasp_qualified ? "Qualified" : "No"],
     ["Collisions", detail.metrics.collisions ?? "—"],
     ["Peak force", detail.metrics.max_contact_force_n === undefined ? "—" : `${detail.metrics.max_contact_force_n} N`],
     ["Sim time", frame ? `${frame.sim_time.toFixed(1)} s` : "—"]
@@ -88,18 +100,18 @@ export default function App() {
   const comparableRuns = runs.filter(run => run.id !== selectedId && !activeStatuses.has(run.status));
 
   return <div className="app">
-    <header><div className="brand-mark">W</div><div><strong>WorldSim Lab</strong><small>Embodied-agent evaluation</small></div><div className="local-pill"><i /> Local runtime</div></header>
+    <header><div className="brand-mark">P</div><div><strong>Praxis Lab</strong><small>Praxis Worlds · embodied-agent evaluation</small></div><div className="local-pill"><i /> Local runtime</div></header>
     <main>
       <section className="hero">
         <div><p className="eyebrow">WAREHOUSE BENCHMARK / V0.1</p><h1>Watch an agent act.<br/><em>Measure what physically happens.</em></h1><p className="lede">A reproducible 3D test world for navigation, contact, manipulation, and recovery—not a prerecorded animation.</p></div>
-        <div className="launch-card"><label className="engine-select">Engine<select value={engineId} onChange={event => setEngineId(event.target.value)}>{engines.length ? engines.map(engine => <option key={engine.id} value={engine.id} disabled={!engine.available}>{engine.name}{engine.physics ? " · PHYSICS" : " · SYNTHETIC"}{!engine.available ? " · NOT INSTALLED" : ""}</option>) : <option value="mujoco_v1">MuJoCo 3.11 · PHYSICS</option>}</select></label><label>Policy<select value={policy} onChange={event => setPolicy(event.target.value)}><option value="baseline_safe">Baseline safe</option><option value="baseline_risky">Baseline risky</option></select></label><label>Seed<input type="number" min="0" value={seed} onChange={event => setSeed(Number(event.target.value))} /></label><button onClick={startRun}>Run simulation <span>→</span></button></div>
+        <div className="launch-card"><label className="engine-select">Engine<select value={engineId} onChange={event => setEngineId(event.target.value)}>{engines.length ? engines.map(engine => <option key={engine.id} value={engine.id} disabled={!engine.available}>{engine.name}{engine.physics ? " · PHYSICS" : " · SYNTHETIC"}{!engine.available ? " · NOT INSTALLED" : ""}</option>) : <option value="mujoco_v1">MuJoCo 3.11 · PHYSICS</option>}</select></label><label>Policy<input list="policy-options" value={policy} onChange={event => setPolicy(event.target.value)} /><datalist id="policy-options"><option value="baseline_safe"/><option value="baseline_risky"/><option value="python:examples.policies.hold_position:HoldPositionPolicy"/></datalist></label><label>Seed<input type="number" min="0" value={seed} onChange={event => setSeed(Number(event.target.value))} /></label><button onClick={startRun}>Run simulation <span>→</span></button></div>
       </section>
       {error && <div className="error"><strong>Runtime unavailable.</strong> {error}. Keep <code>npm run dev</code> open and reload.</div>}
 
       <section className="lab-grid">
         <aside className="runs-panel"><div className="section-title"><span>Recent runs</span><small>{runs.length} recorded</small></div><div className="run-list">{runs.length ? runs.map(run => <button key={run.id} className={`run-row ${selectedId === run.id ? "selected" : ""}`} onClick={() => setSelectedId(run.id)}><div><Status run={run} /><strong>{run.policy_id.replace("baseline_", "")}</strong></div><small>{run.engine_id === "mujoco_v1" ? "PHYSICS" : "SYNTHETIC"} · {run.id.slice(-8)} · seed {run.seed}</small></button>) : <p className="empty">No simulations yet.</p>}</div></aside>
         <section className="viewer-panel">
-          <div className="viewer-head"><div><p className="eyebrow">3D WORLD STATE · SEED {detail?.seed ?? "—"}</p><h2>{detail?.phase ?? "Ready for a run"}</h2></div>{detail && <div className="viewer-badges"><span className={`engine-badge ${detail.engine_id === "mujoco_v1" ? "physics" : "synthetic"}`}>{detail.engine_id === "mujoco_v1" ? "RIGID-BODY PHYSICS" : "SYNTHETIC FIXTURE"}</span><Status run={detail} /></div>}</div>
+          <div className="viewer-head"><div><p className="eyebrow">3D WORLD STATE · SEED {detail?.seed ?? "—"}</p><h2>{detail?.phase ?? "Ready for a run"}</h2></div>{detail && <div className="viewer-badges">{activeStatuses.has(detail.status) && detail.status !== "cancelling" && <button className="cancel-button" onClick={cancelRun}>Cancel</button>}<span className={`engine-badge ${detail.engine_id === "mujoco_v1" ? "physics" : "synthetic"}`}>{detail.engine_id === "mujoco_v1" ? "RIGID-BODY PHYSICS" : "SYNTHETIC FIXTURE"}</span><Status run={detail} /></div>}</div>
           <Suspense fallback={<div className="world-shell world-3d"><div className="world-empty">Loading 3D observer…</div></div>}><WorldView3D frame={frame} frames={visibleFrames} scenario={scenario} /></Suspense>
           <div className="timeline"><button className={`live-toggle ${followLive ? "on" : ""}`} onClick={() => setFollowLive(!followLive)}>{followLive ? "● LIVE" : "FOLLOW LIVE"}</button><input aria-label="Replay timeline" type="range" min="0" max={Math.max(0, frames.length - 1)} value={Math.min(cursor, Math.max(0, frames.length - 1))} onChange={event => { setCursor(Number(event.target.value)); setFollowLive(false); }} /><span>{frame?.sim_time.toFixed(1) ?? "0.0"}s</span></div>
           <div className="progress"><i style={{ width: `${progress}%` }} /><span>{progress}%</span></div>
@@ -109,12 +121,13 @@ export default function App() {
       {detail && <>
         <section className="evidence-grid"><div className="metrics"><div className="section-title"><span>Measured evidence</span><small className={verification?.valid ? "verified" : verification ? "unverified" : ""}>{verification ? verification.valid ? `SHA-256 VERIFIED · ${verification.files_checked} FILES` : "EVIDENCE UNVERIFIED" : finished ? "Checking evidence" : "Streaming"}</small></div><div className="metric-grid">{metricCards.map(([label, value]) => <div className="metric" key={String(label)}><small>{String(label)}</small><strong>{String(value)}</strong></div>)}</div></div><div className="event-log"><div className="section-title"><span>Event trace</span><small>Simulation time</small></div>{detail.events?.slice().reverse().map(event => <div className="event" key={event.sequence}><time>{event.sim_time.toFixed(1)}s</time><span>{event.message}</span></div>)}</div></section>
         <Telemetry frames={frames} cursor={cursor} />
+        <PolicyTrace steps={policySteps} />
         <section className="analysis-grid">
           <div className="limits-panel"><div className="section-title"><span>Limit decisions</span><small>{checks.length ? `${checks.filter(check => check.passed).length}/${checks.length} passed` : "Pending"}</small></div>{checks.map(check => <details className={`limit-row ${check.passed ? "limit-pass" : "limit-fail"}`} key={check.id}><summary><span>{check.id.replaceAll("_", " ")}</span><strong>{String(check.actual)} {check.unit} {check.operator} {String(check.limit)} {check.unit}</strong><i>{check.passed ? "PASS" : "FAIL"}</i></summary><p>{check.rationale}</p><small>Source: {check.source} · Calibration: {check.calibration_status}</small></details>)}</div>
           <div className="compare-panel"><div className="section-title"><span>Compare run</span><small>Same metrics, explicit delta</small></div><select value={compareId} onChange={event => setCompareId(event.target.value)}><option value="">Choose a completed run</option>{comparableRuns.map(run => <option key={run.id} value={run.id}>{run.policy_id.replace("baseline_", "")} · seed {run.seed} · {run.id.slice(-8)}</option>)}</select>{comparison ? <div className="comparison-table">{comparison.metrics.map(metric => <div key={metric.metric}><span>{metric.metric.replaceAll("_", " ")}</span><strong>{String(metric.primary ?? "—")}</strong><span className="versus">vs {String(metric.comparison ?? "—")}</span><i>{metric.delta === null ? "—" : `${metric.delta > 0 ? "+" : ""}${metric.delta.toFixed(1)}`}</i></div>)}</div> : <p className="compare-empty">Select another run to reveal regressions and improvements.</p>}</div>
         </section>
       </>}
     </main>
-    <footer>WorldSim · local development build · scenario schema 1.1 · evidence schema 1.0</footer>
+    <footer>Praxis Worlds · local development build · policy schema 1.0 · frame schema 2.0 · evidence schema 2.0</footer>
   </div>;
 }

@@ -1,4 +1,4 @@
-export type RunStatus = "queued" | "provisioning" | "loading" | "running" | "finalizing" | "succeeded" | "failed" | "cancelled" | "interrupted";
+export type RunStatus = "queued" | "provisioning" | "loading" | "running" | "cancelling" | "finalizing" | "succeeded" | "failed" | "cancelled" | "interrupted";
 
 export interface Frame {
   schema_version: string;
@@ -78,4 +78,19 @@ export interface EvidenceVerification {
   valid: boolean;
   files_checked: number;
   errors: string[];
+}
+
+export interface PolicyObservation {
+  step: number; sim_time: number; robot_x: number; robot_y: number; heading: number;
+  linear_speed_m_s: number; angular_speed_rad_s: number; package_x: number; package_y: number;
+  goal_x: number; goal_y: number; carrying: boolean; grasp_qualified: boolean; contact_force_n: number;
+}
+
+export interface PolicyAction {
+  target_x: number; target_y: number; target_heading: number; shoulder_target_rad: number;
+  elbow_target_rad: number; gripper_target_m: number; request_grasp: boolean; done: boolean;
+}
+
+export interface PolicyStep {
+  sequence: number; observation: PolicyObservation; action: PolicyAction; decision_ms: number;
 }

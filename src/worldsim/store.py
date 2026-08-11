@@ -47,6 +47,7 @@ class RunStore:
                     phase TEXT NOT NULL,
                     verdict TEXT,
                     error TEXT,
+                    cancel_requested INTEGER NOT NULL DEFAULT 0,
                     metrics_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -83,10 +84,20 @@ class RunStore:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS policy_steps (
+                    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                    sequence INTEGER NOT NULL,
+                    observation_json TEXT NOT NULL,
+                    action_json TEXT NOT NULL,
+                    decision_ms REAL NOT NULL,
+                    PRIMARY KEY (run_id, sequence)
+                );
             """)
             columns = {row["name"] for row in db.execute("PRAGMA table_info(runs)")}
             if "engine_id" not in columns:
                 db.execute("ALTER TABLE runs ADD COLUMN engine_id TEXT NOT NULL DEFAULT 'deterministic_mock_v1'")
+            if "cancel_requested" not in columns:
+                db.execute("ALTER TABLE runs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0")
             frame_columns = {row["name"] for row in db.execute("PRAGMA table_info(frames)")}
             telemetry_columns = {
                 "linear_speed_m_s": "REAL", "angular_speed_rad_s": "REAL",
@@ -102,7 +113,7 @@ class RunStore:
         run_id = f"run_{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}"
         with self.connect() as db:
             db.execute(
-                "INSERT INTO runs (id, scenario_id, policy_id, engine_id, seed, status, progress, phase, verdict, error, metrics_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'queued', 0, 'Waiting for worker', NULL, NULL, '{}', ?, ?)",
+                "INSERT INTO runs (id, scenario_id, policy_id, engine_id, seed, status, progress, phase, verdict, error, cancel_requested, metrics_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'queued', 0, 'Waiting for worker', NULL, NULL, 0, '{}', ?, ?)",
                 (run_id, request.scenario_id, request.policy_id, request.engine_id, request.seed, timestamp, timestamp),
             )
             db.execute(
@@ -177,6 +188,39 @@ class RunStore:
                 frame.elbow_angle_rad, frame.gripper_width_m, frame.energy_j,
             ))
 
+    def add_policy_step(self, run_id: str, sequence: int, observation: dict, action: dict, decision_ms: float) -> None:
+        with self.connect() as db:
+            db.execute("INSERT OR REPLACE INTO policy_steps VALUES (?, ?, ?, ?, ?)",
+                       (run_id, sequence, json.dumps(observation), json.dumps(action), decision_ms))
+
+    def get_policy_steps(self, run_id: str) -> list[dict]:
+        with self.connect() as db:
+            rows = db.execute("SELECT sequence, observation_json, action_json, decision_ms FROM policy_steps WHERE run_id=? ORDER BY sequence", (run_id,)).fetchall()
+        return [{"sequence": row["sequence"], "observation": json.loads(row["observation_json"]),
+                 "action": json.loads(row["action_json"]), "decision_ms": row["decision_ms"]} for row in rows]
+
+    def request_cancel(self, run_id: str) -> Run | None:
+        run = self.get_run(run_id)
+        if not run:
+            return None
+        if run.status == "queued":
+            self.update_run(run_id, status="cancelled", progress=run.progress, phase="Cancelled before execution", verdict="cancelled")
+        elif run.status in {"provisioning", "loading", "running", "finalizing"}:
+            with self.connect() as db:
+                db.execute("UPDATE runs SET cancel_requested=1, status='cancelling', phase='Cancellation requested', updated_at=? WHERE id=?", (now_iso(), run_id))
+        return self.get_run(run_id)
+
+    def is_cancel_requested(self, run_id: str) -> bool:
+        with self.connect() as db:
+            row = db.execute("SELECT cancel_requested FROM runs WHERE id=?", (run_id,)).fetchone()
+        return bool(row and row["cancel_requested"])
+
+    def append_event(self, run_id: str, kind: str, message: str, sim_time: float) -> None:
+        with self.connect() as db:
+            row = db.execute("SELECT COALESCE(MAX(sequence), -1) + 1 AS sequence FROM events WHERE run_id=?", (run_id,)).fetchone()
+            db.execute("INSERT INTO events VALUES (?, ?, ?, ?, ?, ?)",
+                       (run_id, row["sequence"], kind, message, sim_time, now_iso()))
+
     def heartbeat(self) -> None:
         with self.connect() as db:
             db.execute("INSERT OR REPLACE INTO system_state VALUES ('worker_seen_at', ?)", (now_iso(),))
@@ -190,4 +234,5 @@ class RunStore:
     def _run(row: sqlite3.Row) -> Run:
         data = dict(row)
         data["metrics"] = json.loads(data.pop("metrics_json"))
+        data["cancel_requested"] = bool(data["cancel_requested"])
         return Run(**data)

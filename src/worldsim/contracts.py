@@ -7,14 +7,14 @@ from pydantic import BaseModel, Field
 
 
 RunStatus = Literal[
-    "queued", "provisioning", "loading", "running", "finalizing",
+    "queued", "provisioning", "loading", "running", "cancelling", "finalizing",
     "succeeded", "failed", "cancelled", "interrupted",
 ]
 
 
 class RunCreate(BaseModel):
     scenario_id: str = "warehouse_v0"
-    policy_id: Literal["baseline_safe", "baseline_risky"] = "baseline_safe"
+    policy_id: str = Field(default="baseline_safe", min_length=1, max_length=200)
     engine_id: Literal["deterministic_mock_v1", "mujoco_v1"] = "mujoco_v1"
     seed: int = Field(default=42, ge=0, le=2_147_483_647)
 
@@ -30,6 +30,7 @@ class Run(BaseModel):
     phase: str
     verdict: str | None = None
     error: str | None = None
+    cancel_requested: bool = False
     metrics: dict = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
@@ -67,6 +68,43 @@ class EvidenceVerification(BaseModel):
     valid: bool
     files_checked: int
     errors: list[str]
+
+
+class PolicyObservation(BaseModel):
+    schema_version: str = "1.0"
+    step: int
+    sim_time: float
+    robot_x: float
+    robot_y: float
+    heading: float
+    linear_speed_m_s: float
+    angular_speed_rad_s: float
+    package_x: float
+    package_y: float
+    goal_x: float
+    goal_y: float
+    carrying: bool
+    grasp_qualified: bool
+    contact_force_n: float
+
+
+class PolicyAction(BaseModel):
+    schema_version: str = "1.0"
+    target_x: float
+    target_y: float
+    target_heading: float
+    shoulder_target_rad: float = -1.02
+    elbow_target_rad: float = 1.30
+    gripper_target_m: float = .12
+    request_grasp: bool = False
+    done: bool = False
+
+
+class PolicyStep(BaseModel):
+    sequence: int
+    observation: PolicyObservation
+    action: PolicyAction
+    decision_ms: float
 
 
 class RunDetail(Run):
