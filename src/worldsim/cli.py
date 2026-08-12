@@ -44,6 +44,7 @@ def request_json(url: str, method: str = "GET", payload: dict | None = None) -> 
 
 
 def download(url: str, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     with urllib.request.urlopen(url, timeout=30) as response:
         path.write_bytes(response.read())
 
@@ -81,6 +82,11 @@ def evaluate(args: argparse.Namespace) -> int:
         summary = experiment["summary"]
         print(f"Candidate pass rate: {summary['candidate_pass_rate']:.1%}")
         print(f"Baseline pass rate:  {summary['baseline_pass_rate']:.1%}")
+        confidence = summary.get("confidence")
+        if confidence:
+            interval = confidence["candidate_pass_rate"]
+            print(f"Candidate 95% range: {interval['lower']:.1%} to {interval['upper']:.1%}")
+            print(f"Evidence strength:   {confidence['sample_guidance']} ({confidence['sample_size']}/{confidence['recommended_minimum_pairs']} pairs)")
         for gate in experiment["gate_results"]:
             print(f"{'PASS' if gate['passed'] else 'FAIL'} {gate['id']}: {gate['actual']} {gate['operator']} {gate['limit']}")
         for format_name in ("json", "csv", "junit"):
@@ -89,7 +95,7 @@ def evaluate(args: argparse.Namespace) -> int:
                 download(f"{api_url}/api/experiments/{experiment['id']}/export?format={format_name}", Path(target))
         print(f"Experiment verdict: {experiment['verdict'].upper()}")
         return 0 if experiment["verdict"] == "pass" else 1
-    except (ValueError, RuntimeError) as exc:
+    except (OSError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

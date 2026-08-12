@@ -101,6 +101,15 @@ export interface Batch {
 }
 
 export interface GateResult { id: string; actual: number; operator: string; limit: number; passed: boolean; }
+export interface ConfidenceInterval { estimate: number | null; lower: number | null; upper: number | null; n: number; }
+export interface ExperimentSummary {
+  candidate_pass_rate: number | null; baseline_pass_rate: number | null; pass_rate_delta: number | null;
+  mean_collision_delta: number | null; mean_force_delta_n: number | null; mean_duration_delta_s: number | null;
+  mean_energy_delta_j: number | null; completed_pairs: number; total_pairs: number;
+  confidence: null | { level: number; method: string; candidate_pass_rate: ConfidenceInterval; baseline_pass_rate: ConfidenceInterval;
+    paired_mean_deltas: Record<string, ConfidenceInterval>; sample_size: number; recommended_minimum_pairs: number;
+    sample_guidance: "development_signal_only" | "sufficient_for_regression_screen" };
+}
 export interface SeedComparison {
   seed: number; candidate_run: Run; baseline_run: Run;
   metric_deltas: Record<string, number | null>; failure_reasons: string[];
@@ -109,5 +118,8 @@ export interface Experiment {
   id: string; scenario_id: string; candidate_policy_id: string; baseline_policy_id: string; engine_id: string;
   seeds: number[]; candidate_batch_id: string; baseline_batch_id: string; created_at: string;
   status: "running" | "complete"; verdict: "pending" | "pass" | "fail";
-  summary: Record<string, number | null>; gate_results: GateResult[]; pairs: SeedComparison[];
+  summary: ExperimentSummary; gate_results: GateResult[]; pairs: SeedComparison[];
 }
+
+export interface EvaluationSuite { id: string; name: string; description: string; scenario_id: string; seeds: number[]; purpose: string; }
+export interface Health { status: string; database: string; worker_seen_at: string | null; active_workers: number; active_runs: number; queued_runs: number; }

@@ -116,6 +116,9 @@ class Health(BaseModel):
     status: str
     database: str
     worker_seen_at: datetime | None
+    active_workers: int = 0
+    active_runs: int = 0
+    queued_runs: int = 0
 
 
 class ScenarioResponse(BaseModel):
@@ -195,3 +198,21 @@ class Experiment(BaseModel):
     summary: dict
     gate_results: list[dict]
     pairs: list[SeedComparison]
+
+
+class EvaluationSuite(BaseModel):
+    id: str
+    name: str
+    description: str
+    scenario_id: str
+    seeds: list[int]
+    purpose: str
+
+
+class WorkerState(BaseModel):
+    id: str
+    process_id: int
+    max_active_runs: int = 1
+    started_at: datetime
+    last_seen_at: datetime
+    current_run_id: str | None = None

@@ -1,5 +1,5 @@
 import { lazy, Suspense, useEffect, useMemo, useState } from "react";
-import type { Batch, Comparison, EngineInfo, EvidenceVerification, Experiment, PolicyStep, Run, Scenario } from "./types";
+import type { Batch, Comparison, EngineInfo, EvaluationSuite, EvidenceVerification, Experiment, Health, PolicyStep, Run, Scenario } from "./types";
 import Telemetry from "./Telemetry";
 import PolicyTrace from "./PolicyTrace";
 import ExperimentPanel from "./ExperimentPanel";
@@ -27,6 +27,9 @@ export default function App() {
   const [runs, setRuns] = useState<Run[]>([]);
   const [batches, setBatches] = useState<Batch[]>([]);
   const [experiments, setExperiments] = useState<Experiment[]>([]);
+  const [selectedExperimentId, setSelectedExperimentId] = useState<string | null>(null);
+  const [suites, setSuites] = useState<EvaluationSuite[]>([]);
+  const [health, setHealth] = useState<Health>();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<Run | null>(null);
   const [scenario, setScenario] = useState<Scenario>();
@@ -46,9 +49,11 @@ export default function App() {
 
   const refresh = async () => {
     try {
-      const [nextRuns, nextBatches, nextExperiments] = await Promise.all([api<Run[]>("/api/runs"), api<Batch[]>("/api/batches"), api<Experiment[]>("/api/experiments")]);
+      const [nextRuns, nextBatches, nextExperiments, nextHealth] = await Promise.all([api<Run[]>("/api/runs"), api<Batch[]>("/api/batches"), api<Experiment[]>("/api/experiments"), api<Health>("/health")]);
       setRuns(nextRuns); setBatches(nextBatches); setExperiments(nextExperiments); setError(null);
+      setHealth(nextHealth);
       if (!selectedId && nextRuns.length) setSelectedId(nextRuns[0].id);
+      setSelectedExperimentId(current => current ?? nextExperiments[0]?.id ?? null);
       if (selectedId) {
         const nextDetail = await api<Run>(`/api/runs/${selectedId}`);
         setDetail(nextDetail);
@@ -59,6 +64,7 @@ export default function App() {
 
   useEffect(() => { refresh(); const timer = window.setInterval(refresh, 500); return () => window.clearInterval(timer); }, [selectedId, followLive]);
   useEffect(() => { api<EngineInfo[]>("/api/engines").then(setEngines).catch(() => setEngines([])); }, []);
+  useEffect(() => { api<EvaluationSuite[]>("/api/suites").then(setSuites).catch(() => setSuites([])); }, []);
   useEffect(() => { if (selectedId) { setDetail(null); setCursor(0); setFollowLive(true); setCompareId(""); setComparison(undefined); setVerification(undefined); setPolicySteps([]); } }, [selectedId]);
   useEffect(() => {
     if (!detail) return;
@@ -101,7 +107,7 @@ export default function App() {
     if (!seeds.length || seeds.length > 50) { setError("Enter between 1 and 50 comma-separated integer seeds"); return; }
     try {
       const experiment = await api<Experiment>("/api/experiments", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ scenario_id: "warehouse_v0", candidate_policy_id: policy, baseline_policy_id: baselinePolicy, engine_id: engineId, seeds }) });
-      setExperiments(current => [experiment, ...current]); setError(null);
+      setExperiments(current => [experiment, ...current]); setSelectedExperimentId(experiment.id); setError(null);
     } catch (reason) { setError(reason instanceof Error ? reason.message : "Could not start experiment"); }
   };
   const cancelExperiment = async (id: string) => {
@@ -123,9 +129,10 @@ export default function App() {
     ["Sim time", frame ? `${frame.sim_time.toFixed(1)} s` : "—"]
   ] : [], [detail, frame]);
   const comparableRuns = runs.filter(run => run.id !== selectedId && !activeStatuses.has(run.status));
+  const selectedExperiment = experiments.find(experiment => experiment.id === selectedExperimentId) ?? experiments[0];
 
   return <div className="app">
-    <header><div className="brand-mark">P</div><div><strong>Praxis Lab</strong><small>Praxis Worlds · embodied-agent evaluation</small></div><div className="local-pill"><i /> Local runtime</div></header>
+    <header><div className="brand-mark">P</div><div><strong>Praxis Lab</strong><small>Praxis Worlds · embodied-agent evaluation</small></div><div className="local-pill"><i /> {health ? `${health.active_workers} WORKER · ${health.active_runs} ACTIVE · ${health.queued_runs} QUEUED` : "Local runtime"}</div></header>
     <main>
       <section className="hero">
         <div><p className="eyebrow">WAREHOUSE BENCHMARK / V0.1</p><h1>Watch an agent act.<br/><em>Measure what physically happens.</em></h1><p className="lede">A reproducible 3D test world for navigation, contact, manipulation, and recovery—not a prerecorded animation.</p></div>
@@ -133,9 +140,10 @@ export default function App() {
       </section>
       {error && <div className="error"><strong>Runtime unavailable.</strong> {error}. Keep <code>npm run dev</code> open and reload.</div>}
       <section className="batch-bar"><div><p className="eyebrow">BENCHMARK BATCH</p><strong>Evaluate this policy across deterministic seeds</strong></div><label>Seeds<input value={batchSeeds} onChange={event => setBatchSeeds(event.target.value)} placeholder="1, 2, 3, 4, 5" /></label><button onClick={startBatch}>Run batch</button></section>
-      <section className="experiment-launch"><div><p className="eyebrow">REGRESSION EXPERIMENT</p><strong>Compare the selected candidate against a locked baseline</strong></div><label>Baseline<input list="policy-options" value={baselinePolicy} onChange={event => setBaselinePolicy(event.target.value)} /></label><button onClick={startExperiment}>Compare policies</button></section>
+      <section className="experiment-launch"><div><p className="eyebrow">REGRESSION EXPERIMENT</p><strong>Compare the selected candidate against a locked baseline</strong></div><label>Evaluation suite<select value={suites.find(suite => suite.seeds.join(", ") === batchSeeds)?.id ?? "custom"} onChange={event => { const suite = suites.find(item => item.id === event.target.value); if (suite) setBatchSeeds(suite.seeds.join(", ")); }}><option value="custom">Custom seeds</option>{suites.map(suite => <option key={suite.id} value={suite.id}>{suite.name} · {suite.seeds.length} pairs</option>)}</select></label><label>Baseline<input list="policy-options" value={baselinePolicy} onChange={event => setBaselinePolicy(event.target.value)} /></label><button onClick={startExperiment}>Compare policies</button></section>
       {batches.length > 0 && <section className="batch-list">{batches.slice(0, 3).map(batch => { const completed = (batch.counts.succeeded ?? 0) + (batch.counts.failed ?? 0) + (batch.counts.cancelled ?? 0); return <div key={batch.id}><button onClick={() => batch.runs[0] && setSelectedId(batch.runs[0].id)}><span>{batch.policy_id}</span><small>{batch.seeds.length} SEEDS · {completed}/{batch.runs.length} COMPLETE</small></button><div className="batch-progress"><i style={{ width: `${batch.runs.length ? completed / batch.runs.length * 100 : 0}%` }} /></div><strong>{batch.pass_rate === null ? "RUNNING" : `${Math.round(batch.pass_rate * 100)}% PASS`}</strong></div>; })}</section>}
-      {experiments[0] && <ExperimentPanel experiment={experiments[0]} selectRun={setSelectedId} cancel={() => cancelExperiment(experiments[0].id)} />}
+      {experiments.length > 0 && <section className="experiment-history"><div className="section-title"><span>Experiment history</span><small>{experiments.length} durable comparisons</small></div><div>{experiments.map(experiment => <button className={selectedExperiment?.id === experiment.id ? "selected" : ""} key={experiment.id} onClick={() => setSelectedExperimentId(experiment.id)}><span>{experiment.candidate_policy_id.replace("baseline_", "")} vs {experiment.baseline_policy_id.replace("baseline_", "")}</span><small>{experiment.seeds.length} PAIRS · {new Date(experiment.created_at).toLocaleString()}</small><strong className={experiment.verdict}>{experiment.verdict}</strong></button>)}</div></section>}
+      {selectedExperiment && <ExperimentPanel experiment={selectedExperiment} selectRun={setSelectedId} cancel={() => cancelExperiment(selectedExperiment.id)} />}
 
       <section className="lab-grid">
         <aside className="runs-panel"><div className="section-title"><span>Recent runs</span><small>{runs.length} recorded</small></div><div className="run-list">{runs.length ? runs.map(run => <button key={run.id} className={`run-row ${selectedId === run.id ? "selected" : ""}`} onClick={() => setSelectedId(run.id)}><div><Status run={run} /><strong>{run.policy_id.replace("baseline_", "")}</strong></div><small>{run.engine_id === "mujoco_v1" ? "PHYSICS" : "SYNTHETIC"} · {run.id.slice(-8)} · seed {run.seed}</small></button>) : <p className="empty">No simulations yet.</p>}</div></aside>

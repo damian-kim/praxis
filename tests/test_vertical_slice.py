@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -19,6 +20,7 @@ from worldsim.contracts import PolicyObservation
 from worldsim.policy_runtime import IsolatedPolicyClient, PolicyRuntimeError
 from worldsim.cli import parse_seeds
 from worldsim.store import RunStore
+from worldsim.statistics import mean_interval, wilson_interval
 
 
 def settings_for(tmp_path: Path) -> Settings:
@@ -292,6 +294,8 @@ def test_paired_experiment_gates_and_exports(tmp_path: Path) -> None:
     assert experiment["verdict"] == "fail"
     assert experiment["summary"]["candidate_pass_rate"] == 0
     assert experiment["summary"]["baseline_pass_rate"] == 1
+    assert experiment["summary"]["confidence"]["sample_guidance"] == "development_signal_only"
+    assert experiment["summary"]["confidence"]["candidate_pass_rate"]["upper"] > 0
     assert all("max_collisions" in pair["failure_reasons"] for pair in experiment["pairs"])
     assert "candidate_verdict" in csv_export.text
     assert "<testsuite" in junit_export.text
@@ -309,3 +313,50 @@ def test_batch_cancellation_and_seed_parser(tmp_path: Path) -> None:
     assert parse_seeds("1..3, 3, 7") == [1, 2, 3, 7]
     with pytest.raises(ValueError):
         parse_seeds("5..2")
+
+
+def test_confidence_reporting_and_evaluation_suites(tmp_path: Path) -> None:
+    perfect = wilson_interval(10, 10)
+    assert perfect["estimate"] == 1
+    assert 0 < perfect["lower"] < perfect["upper"] <= 1
+    paired = mean_interval([1.0, 2.0, 3.0])
+    assert paired["estimate"] == 2
+    assert paired["lower"] < 2 < paired["upper"]
+
+    with TestClient(create_app(settings_for(tmp_path))) as client:
+        suites = client.get("/api/suites")
+        health = client.get("/health")
+    assert suites.status_code == 200
+    assert [suite["id"] for suite in suites.json()] == ["warehouse_smoke", "warehouse_regression", "warehouse_extended"]
+    assert len(suites.json()[1]["seeds"]) == 10
+    assert health.json()["active_workers"] == 0
+    assert health.json()["queued_runs"] == 0
+
+
+def test_worker_leases_enforce_global_concurrency_and_recover_crashes(tmp_path: Path) -> None:
+    store = RunStore(settings_for(tmp_path).db_path)
+    first = store.create_run(RunCreate(seed=1))
+    second = store.create_run(RunCreate(seed=2))
+    store.register_worker("worker-one", 1001)
+    store.register_worker("worker-two", 1002)
+
+    assert store.claim_next("worker-one", max_active=1).id == first.id
+    assert store.claim_next("worker-two", max_active=1) is None
+    store.update_run(first.id, status="succeeded", progress=1, phase="done", verdict="pass")
+    store.release_worker_run("worker-one")
+    assert store.claim_next("worker-two", max_active=1).id == second.id
+    store.update_run(second.id, status="succeeded", progress=1, phase="done", verdict="pass")
+    store.release_worker_run("worker-two")
+    store.unregister_worker("worker-one")
+    store.unregister_worker("worker-two")
+
+    crashed = store.create_run(RunCreate(seed=3))
+    store.register_worker("crashed-worker", 1003)
+    assert store.claim_next("crashed-worker", max_active=1).id == crashed.id
+    expired = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+    with store.connect() as db:
+        db.execute("UPDATE workers SET last_seen_at=? WHERE id='crashed-worker'", (expired,))
+    assert store.recover_stale_workers(lease_seconds=10) == 1
+    recovered = store.get_run(crashed.id)
+    assert recovered.status == "interrupted"
+    assert recovered.phase == "Worker lease expired"

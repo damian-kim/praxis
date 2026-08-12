@@ -6,17 +6,18 @@ from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import Settings
-from .contracts import Batch, BatchCreate, EvidenceVerification, Experiment, ExperimentCreate, Health, MetricComparison, PolicyStep, Run, RunComparison, RunCreate, RunDetail, ScenarioResponse
+from .contracts import Batch, BatchCreate, EvaluationSuite, EvidenceVerification, Experiment, ExperimentCreate, Health, MetricComparison, PolicyStep, Run, RunComparison, RunCreate, RunDetail, ScenarioResponse, WorkerState
 from .evidence import verify_evidence_bundle
 from .exports import experiment_csv, experiment_junit
 from .scenario import load_scenario
 from .store import RunStore
+from .suites import list_suites
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     store = RunStore(settings.db_path)
-    app = FastAPI(title="Praxis Worlds API", version="0.5.0")
+    app = FastAPI(title="Praxis Worlds API", version="0.6.0")
     app.state.settings = settings
     app.state.store = store
     app.add_middleware(
@@ -29,8 +30,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/health", response_model=Health)
     def health() -> Health:
+        store.list_workers()
         seen = store.worker_seen_at()
-        return Health(status="ok", database=str(settings.db_path), worker_seen_at=datetime.fromisoformat(seen) if seen else None)
+        queue = store.queue_status()
+        return Health(status="ok", database=str(settings.db_path), worker_seen_at=datetime.fromisoformat(seen) if seen else None,
+                      **queue)
+
+    @app.get("/api/workers", response_model=list[WorkerState])
+    def workers() -> list[WorkerState]:
+        return store.list_workers()
+
+    @app.get("/api/suites", response_model=list[EvaluationSuite])
+    def suites() -> list[EvaluationSuite]:
+        return list_suites()
 
     @app.get("/api/runs", response_model=list[Run])
     def list_runs() -> list[Run]:

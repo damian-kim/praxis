@@ -32,6 +32,8 @@ The first command installs the editable Python package and web dependencies. Lat
 - Launch a 1–50 seed benchmark batch and monitor aggregate pass rate.
 - Compare a candidate and baseline on identical seeds with explicit regression gates.
 - Export paired results as JSON, CSV, or JUnit and open any candidate replay from the seed matrix.
+- Reuse 3-, 10-, or 25-seed evaluation suites and inspect 95% confidence ranges.
+- Navigate durable experiment history and see live worker/queue capacity in the header.
 - Rely on isolated policy subprocesses with hard 100 ms action deadlines.
 - Restart the app; previous runs remain available because they are stored in `.worldsim/worldsim.db`.
 - Inspect immutable evidence in `.worldsim/runs/<run-id>/evidence.json`.
@@ -69,4 +71,4 @@ docs/architecture-decisions/    Important technical decisions
 tests/                           End-to-end vertical-slice tests
 ```
 
-Review [Sprint 1](docs/prds/001-durable-world-test-lab.md), [Sprint 2](docs/prds/002-engine-neutral-3d-evaluation.md), [Sprint 3](docs/prds/003-mujoco-physics-adapter.md), [Sprint 4](docs/prds/004-articulated-telemetry-and-integrity.md), [Sprint 5](docs/prds/005-policy-sdk-and-qualified-grasp.md), [Sprint 6](docs/prds/006-policy-isolation-and-batches.md), and [Sprint 7](docs/prds/007-comparative-evaluation-and-ci.md) for goals, designs, acceptance criteria, risks, and validity boundaries. See the [Python Policy SDK](docs/sdk/python-policy.md), [process protocol](docs/sdk/policy-protocol.md), and [CI evaluation guide](docs/sdk/ci-evaluation.md) to connect and evaluate an external policy.
+Review [Sprint 1](docs/prds/001-durable-world-test-lab.md), [Sprint 2](docs/prds/002-engine-neutral-3d-evaluation.md), [Sprint 3](docs/prds/003-mujoco-physics-adapter.md), [Sprint 4](docs/prds/004-articulated-telemetry-and-integrity.md), [Sprint 5](docs/prds/005-policy-sdk-and-qualified-grasp.md), [Sprint 6](docs/prds/006-policy-isolation-and-batches.md), [Sprint 7](docs/prds/007-comparative-evaluation-and-ci.md), and [Sprint 8](docs/prds/008-evaluation-confidence-and-runtime-control.md) for goals, designs, acceptance criteria, risks, and validity boundaries. See the [Python Policy SDK](docs/sdk/python-policy.md), [process protocol](docs/sdk/policy-protocol.md), and [CI evaluation guide](docs/sdk/ci-evaluation.md) to connect and evaluate an external policy.

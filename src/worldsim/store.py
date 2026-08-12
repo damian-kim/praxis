@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Iterator
 
-from .contracts import Batch, BatchCreate, Experiment, ExperimentCreate, Frame, GateConfig, Run, RunCreate, RunDetail, SeedComparison
+from .contracts import Batch, BatchCreate, Experiment, ExperimentCreate, Frame, GateConfig, Run, RunCreate, RunDetail, SeedComparison, WorkerState
+from .statistics import experiment_confidence
 
 
 def now_iso() -> str:
@@ -118,6 +120,14 @@ class RunStore:
                     gates_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS workers (
+                    id TEXT PRIMARY KEY,
+                    process_id INTEGER NOT NULL,
+                    max_active_runs INTEGER NOT NULL DEFAULT 1,
+                    started_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    current_run_id TEXT
+                );
             """)
             columns = {row["name"] for row in db.execute("PRAGMA table_info(runs)")}
             if "engine_id" not in columns:
@@ -133,6 +143,9 @@ class RunStore:
             for name, sql_type in telemetry_columns.items():
                 if name not in frame_columns:
                     db.execute(f"ALTER TABLE frames ADD COLUMN {name} {sql_type}")
+            worker_columns = {row["name"] for row in db.execute("PRAGMA table_info(workers)")}
+            if "max_active_runs" not in worker_columns:
+                db.execute("ALTER TABLE workers ADD COLUMN max_active_runs INTEGER NOT NULL DEFAULT 1")
 
     def create_run(self, request: RunCreate) -> Run:
         timestamp = now_iso()
@@ -250,8 +263,11 @@ class RunStore:
         candidate_pass_rate = candidate_passes / len(pairs) if complete else None
         baseline_pass_rate = baseline_passes / len(pairs) if complete else None
 
+        delta_values = {key: [pair.metric_deltas[key] for pair in pairs if pair.metric_deltas[key] is not None]
+                        for key in metric_keys}
+
         def mean_delta(key: str) -> float | None:
-            values = [pair.metric_deltas[key] for pair in pairs if pair.metric_deltas[key] is not None]
+            values = delta_values[key]
             return sum(values) / len(values) if values and complete else None
 
         summary = {
@@ -265,6 +281,8 @@ class RunStore:
             "completed_pairs": sum(pair.candidate_run.status in terminal and pair.baseline_run.status in terminal for pair in pairs),
             "total_pairs": len(pairs),
         }
+        summary["confidence"] = (experiment_confidence(candidate_passes, baseline_passes, len(pairs), delta_values)
+                                 if complete else None)
         gate_results = self._gate_results(gates, summary) if complete else []
         verdict = "pass" if complete and all(result["passed"] for result in gate_results) else "fail" if complete else "pending"
         return Experiment(id=row["id"], scenario_id=row["scenario_id"], candidate_policy_id=row["candidate_policy_id"],
@@ -327,9 +345,50 @@ class RunStore:
             frame["carrying"] = bool(frame["carrying"])
         return RunDetail(**run.model_dump(), events=events, frames=frames)
 
-    def claim_next(self) -> Run | None:
+    def register_worker(self, worker_id: str, process_id: int | None = None, max_active_runs: int = 1) -> WorkerState:
+        timestamp = now_iso()
+        with self.connect() as db:
+            db.execute("INSERT OR REPLACE INTO workers (id, process_id, max_active_runs, started_at, last_seen_at, current_run_id) VALUES (?, ?, ?, ?, ?, NULL)",
+                       (worker_id, process_id or os.getpid(), max(1, max_active_runs), timestamp, timestamp))
+        return self.get_worker(worker_id)
+
+    def get_worker(self, worker_id: str) -> WorkerState | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM workers WHERE id=?", (worker_id,)).fetchone()
+        return WorkerState(id=row["id"], process_id=row["process_id"], max_active_runs=row["max_active_runs"], started_at=row["started_at"],
+                           last_seen_at=row["last_seen_at"], current_run_id=row["current_run_id"]) if row else None
+
+    def list_workers(self, lease_seconds: float = 10) -> list[WorkerState]:
+        self.recover_stale_workers(lease_seconds)
+        with self.connect() as db:
+            rows = db.execute("SELECT * FROM workers ORDER BY started_at").fetchall()
+        return [WorkerState(id=row["id"], process_id=row["process_id"], max_active_runs=row["max_active_runs"], started_at=row["started_at"],
+                            last_seen_at=row["last_seen_at"], current_run_id=row["current_run_id"]) for row in rows]
+
+    def recover_stale_workers(self, lease_seconds: float = 10) -> int:
+        cutoff = (datetime.now(UTC) - timedelta(seconds=lease_seconds)).isoformat()
+        with self.connect() as db:
+            stale = db.execute("SELECT current_run_id FROM workers WHERE last_seen_at < ? AND current_run_id IS NOT NULL", (cutoff,)).fetchall()
+            for row in stale:
+                db.execute("UPDATE runs SET status='interrupted', verdict='error', phase='Worker lease expired', error='Worker heartbeat expired during execution', updated_at=? WHERE id=? AND status IN ('provisioning','loading','running','finalizing')",
+                           (now_iso(), row["current_run_id"]))
+            removed = db.execute("DELETE FROM workers WHERE last_seen_at < ?", (cutoff,)).rowcount
+        return removed
+
+    def claim_next(self, worker_id: str | None = None, max_active: int = 1, lease_seconds: float = 10) -> Run | None:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if worker_id:
+                cutoff = (datetime.now(UTC) - timedelta(seconds=lease_seconds)).isoformat()
+                stale = db.execute("SELECT current_run_id FROM workers WHERE last_seen_at < ? AND current_run_id IS NOT NULL", (cutoff,)).fetchall()
+                for stale_row in stale:
+                    db.execute("UPDATE runs SET status='interrupted', verdict='error', phase='Worker lease expired', error='Worker heartbeat expired during execution', updated_at=? WHERE id=? AND status IN ('provisioning','loading','running','finalizing')",
+                               (now_iso(), stale_row["current_run_id"]))
+                db.execute("DELETE FROM workers WHERE last_seen_at < ?", (cutoff,))
+                capacity = db.execute("SELECT MIN(max_active_runs) AS capacity FROM workers").fetchone()["capacity"]
+                active = db.execute("SELECT COUNT(*) AS count FROM workers WHERE current_run_id IS NOT NULL").fetchone()["count"]
+                if active >= min(max(1, max_active), capacity or 1):
+                    return None
             row = db.execute("SELECT id FROM runs WHERE status='queued' ORDER BY created_at LIMIT 1").fetchone()
             if not row:
                 return None
@@ -341,7 +400,25 @@ class RunStore:
             if not changed:
                 return None
             claimed = db.execute("SELECT * FROM runs WHERE id=?", (row["id"],)).fetchone()
+            if worker_id:
+                db.execute("UPDATE workers SET current_run_id=?, last_seen_at=? WHERE id=?",
+                           (row["id"], timestamp, worker_id))
         return self._run(claimed)
+
+    def release_worker_run(self, worker_id: str) -> None:
+        with self.connect() as db:
+            db.execute("UPDATE workers SET current_run_id=NULL, last_seen_at=? WHERE id=?", (now_iso(), worker_id))
+
+    def unregister_worker(self, worker_id: str) -> None:
+        with self.connect() as db:
+            db.execute("DELETE FROM workers WHERE id=?", (worker_id,))
+
+    def queue_status(self) -> dict[str, int]:
+        with self.connect() as db:
+            queued = db.execute("SELECT COUNT(*) AS count FROM runs WHERE status='queued'").fetchone()["count"]
+            active = db.execute("SELECT COUNT(*) AS count FROM workers WHERE current_run_id IS NOT NULL").fetchone()["count"]
+            workers = db.execute("SELECT COUNT(*) AS count FROM workers").fetchone()["count"]
+        return {"queued_runs": queued, "active_runs": active, "active_workers": workers}
 
     def update_run(self, run_id: str, *, status: str, progress: float, phase: str,
                    verdict: str | None = None, error: str | None = None, metrics: dict | None = None) -> None:
@@ -401,9 +478,11 @@ class RunStore:
             db.execute("INSERT INTO events VALUES (?, ?, ?, ?, ?, ?)",
                        (run_id, row["sequence"], kind, message, sim_time, now_iso()))
 
-    def heartbeat(self) -> None:
+    def heartbeat(self, worker_id: str | None = None) -> None:
         with self.connect() as db:
             db.execute("INSERT OR REPLACE INTO system_state VALUES ('worker_seen_at', ?)", (now_iso(),))
+            if worker_id:
+                db.execute("UPDATE workers SET last_seen_at=? WHERE id=?", (now_iso(), worker_id))
 
     def worker_seen_at(self) -> str | None:
         with self.connect() as db:
