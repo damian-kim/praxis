@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "worldsim-local"
-version = "0.1.0"
+version = "0.2.0"
 description = "Physics-world evaluation lab for embodied agents"
 requires-python = ">=3.11"
 dependencies = [
@@ -17,7 +17,7 @@ dependencies = [
 praxis = "worldsim.cli:main"
 
 [project.optional-dependencies]
-dev = ["httpx2>=2.10", "pytest>=8.3"]
+dev = ["httpx>=0.28", "pytest>=8.3"]
 physics = ["mujoco==3.11.0"]
 
 [tool.setuptools.packages.find]

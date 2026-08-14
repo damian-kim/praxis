@@ -9,6 +9,7 @@ from dataclasses import asdict
 
 from .contracts import PolicyAction, PolicyObservation
 from .policy import EpisodeContext
+from .policy_sandbox import PolicyRunnerConfig
 
 
 PROTOCOL_VERSION = "1.0"
@@ -19,27 +20,34 @@ class PolicyRuntimeError(RuntimeError):
 
 
 class IsolatedPolicyClient:
-    def __init__(self, policy_id: str, context: EpisodeContext, timeout_ms: int = 100):
+    def __init__(self, policy_id: str, context: EpisodeContext, timeout_ms: int = 100,
+                 runner: PolicyRunnerConfig | None = None):
         self.policy_id = policy_id
         self.context = context
         self.timeout_ms = timeout_ms
         self.process: subprocess.Popen | None = None
         self.messages: queue.Queue[str | None] = queue.Queue()
         self.stderr_tail: list[str] = []
+        self.runner = runner or PolicyRunnerConfig.from_env()
 
     def start(self) -> None:
-        self.process = subprocess.Popen(
-            [sys.executable, "-m", "worldsim.policy_host", "--policy-id", self.policy_id],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", bufsize=1,
-        )
-        threading.Thread(target=self._read_stdout, daemon=True).start()
-        threading.Thread(target=self._read_stderr, daemon=True).start()
-        self._send({"type": "init", "protocol_version": PROTOCOL_VERSION, "context": asdict(self.context)})
-        message = self._receive(timeout_ms=max(1000, self.timeout_ms * 10))
-        if message.get("type") != "ready":
+        command = self.runner.command(self.policy_id, sys.executable)
+        try:
+            self.process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", bufsize=1,
+            )
+            threading.Thread(target=self._read_stdout, daemon=True).start()
+            threading.Thread(target=self._read_stderr, daemon=True).start()
+            self._send({"type": "init", "protocol_version": PROTOCOL_VERSION, "context": asdict(self.context)})
+            startup_timeout = 15_000 if self.runner.mode == "docker" else 1_000
+            message = self._receive(timeout_ms=max(startup_timeout, self.timeout_ms * 10))
+            if message.get("type") != "ready":
+                raise PolicyRuntimeError(message.get("error", "Policy host failed to initialize"))
+        except Exception:
             self.close()
-            raise PolicyRuntimeError(message.get("error", "Policy host failed to initialize"))
+            raise
 
     def act(self, observation: PolicyObservation) -> PolicyAction:
         if not self.process:
@@ -116,4 +124,3 @@ class IsolatedPolicyClient:
 
     def __exit__(self, *_: object) -> None:
         self.close()
-

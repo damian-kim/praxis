@@ -26,8 +26,11 @@ def work_once(store: RunStore, settings: Settings, frame_delay: float = 0.10,
         heartbeat_thread = threading.Thread(target=maintain_lease, name="praxis-worker-heartbeat", daemon=True)
         heartbeat_thread.start()
     try:
-        engine_id = os.getenv("WORLDSIM_ENGINE", run.engine_id)
-        engine = resolve_engine(engine_id, settings.scenario_path)
+        engine_id = run.engine_id
+        scenario_path = settings.scenario_path_for(run.scenario_id)
+        if not scenario_path.is_file():
+            raise RuntimeError(f"Scenario '{run.scenario_id}' is not installed")
+        engine = resolve_engine(engine_id, scenario_path)
         engine.execute(store, run, settings.data_dir, frame_delay)
     except Exception as exc:
         store.update_run(run.id, status="failed", progress=1, phase="Worker error", verdict="error", error=str(exc))

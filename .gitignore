@@ -6,4 +6,4 @@ __pycache__/
 .venv/
 apps/web/node_modules/
 apps/web/dist/
-
+build/

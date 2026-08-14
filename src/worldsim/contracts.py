@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 RunStatus = Literal[
@@ -125,6 +125,13 @@ class ScenarioResponse(BaseModel):
     definition: dict
 
 
+class ScenarioInfo(BaseModel):
+    id: str
+    name: str
+    objective: str
+    schema_version: str
+
+
 class MetricComparison(BaseModel):
     metric: str
     primary: float | bool | None
@@ -204,9 +211,51 @@ class EvaluationSuite(BaseModel):
     id: str
     name: str
     description: str
-    scenario_id: str
-    seeds: list[int]
+    cases: list["SuiteCase"]
     purpose: str
+
+    @computed_field
+    def pair_count(self) -> int:
+        return sum(len(case.seeds) for case in self.cases)
+
+    @computed_field
+    @property
+    def seeds(self) -> list[int]:
+        """Flattened compatibility view; suite execution still preserves scenario boundaries."""
+        return [seed for case in self.cases for seed in case.seeds]
+
+    @computed_field
+    @property
+    def scenario_id(self) -> str:
+        return self.cases[0].scenario_id if len(self.cases) == 1 else "multiple"
+
+
+class SuiteCase(BaseModel):
+    scenario_id: str
+    seeds: list[int] = Field(min_length=1, max_length=50)
+
+
+class SuiteEvaluationCreate(BaseModel):
+    suite_id: str
+    candidate_policy_id: str = Field(min_length=1, max_length=200)
+    baseline_policy_id: str = Field(default="baseline_safe", min_length=1, max_length=200)
+    engine_id: Literal["deterministic_mock_v1", "mujoco_v1"] = "mujoco_v1"
+    gates: GateConfig = Field(default_factory=GateConfig)
+
+
+class SuiteEvaluation(BaseModel):
+    id: str
+    suite_id: str
+    candidate_policy_id: str
+    baseline_policy_id: str
+    engine_id: str
+    experiment_ids: list[str]
+    created_at: datetime
+    status: Literal["running", "complete"]
+    verdict: Literal["pending", "pass", "fail"]
+    completed_pairs: int
+    total_pairs: int
+    scenario_results: list[Experiment]
 
 
 class WorkerState(BaseModel):

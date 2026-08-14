@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Iterator
 
-from .contracts import Batch, BatchCreate, Experiment, ExperimentCreate, Frame, GateConfig, Run, RunCreate, RunDetail, SeedComparison, WorkerState
+from .contracts import Batch, BatchCreate, EvaluationSuite, Experiment, ExperimentCreate, Frame, GateConfig, Run, RunCreate, RunDetail, SeedComparison, SuiteEvaluation, SuiteEvaluationCreate, WorkerState
 from .statistics import experiment_confidence
 
 
@@ -127,6 +127,22 @@ class RunStore:
                     started_at TEXT NOT NULL,
                     last_seen_at TEXT NOT NULL,
                     current_run_id TEXT
+                );
+                CREATE TABLE IF NOT EXISTS suite_evaluations (
+                    id TEXT PRIMARY KEY,
+                    suite_id TEXT NOT NULL,
+                    candidate_policy_id TEXT NOT NULL,
+                    baseline_policy_id TEXT NOT NULL,
+                    engine_id TEXT NOT NULL,
+                    gates_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS suite_experiments (
+                    suite_evaluation_id TEXT NOT NULL REFERENCES suite_evaluations(id) ON DELETE CASCADE,
+                    experiment_id TEXT NOT NULL REFERENCES experiments(id) ON DELETE CASCADE,
+                    scenario_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    PRIMARY KEY (suite_evaluation_id, experiment_id)
                 );
             """)
             columns = {row["name"] for row in db.execute("PRAGMA table_info(runs)")}
@@ -304,6 +320,62 @@ class RunStore:
         self.cancel_batch(experiment.baseline_batch_id)
         return self.get_experiment(experiment_id)
 
+    def create_suite_evaluation(self, request: SuiteEvaluationCreate, suite: EvaluationSuite) -> SuiteEvaluation:
+        evaluation_id = f"suite_{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}"
+        timestamp = now_iso()
+        with self.connect() as db:
+            db.execute("INSERT INTO suite_evaluations VALUES (?, ?, ?, ?, ?, ?, ?)",
+                       (evaluation_id, suite.id, request.candidate_policy_id, request.baseline_policy_id,
+                        request.engine_id, request.gates.model_dump_json(), timestamp))
+        for sequence, case in enumerate(suite.cases):
+            experiment = self.create_experiment(ExperimentCreate(
+                scenario_id=case.scenario_id, candidate_policy_id=request.candidate_policy_id,
+                baseline_policy_id=request.baseline_policy_id, engine_id=request.engine_id,
+                seeds=case.seeds, gates=request.gates,
+            ))
+            with self.connect() as db:
+                db.execute("INSERT INTO suite_experiments VALUES (?, ?, ?, ?)",
+                           (evaluation_id, experiment.id, case.scenario_id, sequence))
+        return self.get_suite_evaluation(evaluation_id)
+
+    def get_suite_evaluation(self, evaluation_id: str) -> SuiteEvaluation | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM suite_evaluations WHERE id=?", (evaluation_id,)).fetchone()
+            if not row:
+                return None
+            experiment_ids = [item["experiment_id"] for item in db.execute(
+                "SELECT experiment_id FROM suite_experiments WHERE suite_evaluation_id=? ORDER BY sequence",
+                (evaluation_id,),
+            )]
+        experiments = [experiment for experiment_id in experiment_ids
+                       if (experiment := self.get_experiment(experiment_id)) is not None]
+        complete = len(experiments) == len(experiment_ids) and all(item.status == "complete" for item in experiments)
+        completed_pairs = sum(int(item.summary.get("completed_pairs", 0)) for item in experiments)
+        total_pairs = sum(int(item.summary.get("total_pairs", 0)) for item in experiments)
+        verdict = "pass" if complete and all(item.verdict == "pass" for item in experiments) else "fail" if complete else "pending"
+        return SuiteEvaluation(
+            id=row["id"], suite_id=row["suite_id"], candidate_policy_id=row["candidate_policy_id"],
+            baseline_policy_id=row["baseline_policy_id"], engine_id=row["engine_id"],
+            experiment_ids=experiment_ids, created_at=row["created_at"],
+            status="complete" if complete else "running", verdict=verdict,
+            completed_pairs=completed_pairs, total_pairs=total_pairs, scenario_results=experiments,
+        )
+
+    def list_suite_evaluations(self, limit: int = 20) -> list[SuiteEvaluation]:
+        with self.connect() as db:
+            ids = [row["id"] for row in db.execute(
+                "SELECT id FROM suite_evaluations ORDER BY created_at DESC LIMIT ?", (limit,)
+            )]
+        return [item for evaluation_id in ids if (item := self.get_suite_evaluation(evaluation_id)) is not None]
+
+    def cancel_suite_evaluation(self, evaluation_id: str) -> SuiteEvaluation | None:
+        evaluation = self.get_suite_evaluation(evaluation_id)
+        if not evaluation:
+            return None
+        for experiment_id in evaluation.experiment_ids:
+            self.cancel_experiment(experiment_id)
+        return self.get_suite_evaluation(evaluation_id)
+
     @staticmethod
     def _is_number(value: object) -> bool:
         return isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -311,19 +383,16 @@ class RunStore:
     @staticmethod
     def _gate_results(gates: GateConfig, summary: dict) -> list[dict]:
         definitions = [
-            ("candidate_pass_rate", summary["candidate_pass_rate"], ">=", gates.min_candidate_pass_rate,
-             summary["candidate_pass_rate"] >= gates.min_candidate_pass_rate),
-            ("pass_rate_drop", -summary["pass_rate_delta"], "<=", gates.max_pass_rate_drop,
-             -summary["pass_rate_delta"] <= gates.max_pass_rate_drop),
-            ("mean_collision_increase", summary["mean_collision_delta"], "<=", gates.max_mean_collision_increase,
-             summary["mean_collision_delta"] <= gates.max_mean_collision_increase),
-            ("mean_force_increase_n", summary["mean_force_delta_n"], "<=", gates.max_mean_force_increase_n,
-             summary["mean_force_delta_n"] <= gates.max_mean_force_increase_n),
-            ("mean_duration_increase_s", summary["mean_duration_delta_s"], "<=", gates.max_mean_duration_increase_s,
-             summary["mean_duration_delta_s"] <= gates.max_mean_duration_increase_s),
+            ("candidate_pass_rate", summary["candidate_pass_rate"], ">=", gates.min_candidate_pass_rate),
+            ("pass_rate_drop", -summary["pass_rate_delta"] if summary["pass_rate_delta"] is not None else None,
+             "<=", gates.max_pass_rate_drop),
+            ("mean_collision_increase", summary["mean_collision_delta"], "<=", gates.max_mean_collision_increase),
+            ("mean_force_increase_n", summary["mean_force_delta_n"], "<=", gates.max_mean_force_increase_n),
+            ("mean_duration_increase_s", summary["mean_duration_delta_s"], "<=", gates.max_mean_duration_increase_s),
         ]
-        return [{"id": gate_id, "actual": actual, "operator": operator, "limit": limit, "passed": passed}
-                for gate_id, actual, operator, limit, passed in definitions]
+        return [{"id": gate_id, "actual": actual, "operator": operator, "limit": limit,
+                 "passed": actual is not None and (actual >= limit if operator == ">=" else actual <= limit)}
+                for gate_id, actual, operator, limit in definitions]
 
     def get_run(self, run_id: str) -> Run | None:
         with self.connect() as db:

@@ -18,6 +18,7 @@ from worldsim.evidence import verify_evidence_bundle
 from worldsim.policy import EpisodeContext, load_policy
 from worldsim.contracts import PolicyObservation
 from worldsim.policy_runtime import IsolatedPolicyClient, PolicyRuntimeError
+from worldsim.policy_sandbox import PolicyRunnerConfig, PolicyRunnerConfigurationError
 from worldsim.cli import parse_seeds
 from worldsim.store import RunStore
 from worldsim.statistics import mean_interval, wilson_interval
@@ -360,3 +361,104 @@ def test_worker_leases_enforce_global_concurrency_and_recover_crashes(tmp_path: 
     recovered = store.get_run(crashed.id)
     assert recovered.status == "interrupted"
     assert recovered.phase == "Worker lease expired"
+
+
+def test_multi_world_suite_is_durable_and_aggregates_scenarios(tmp_path: Path) -> None:
+    settings = settings_for(tmp_path)
+    store = RunStore(settings.db_path)
+    with TestClient(create_app(settings)) as client:
+        scenarios = client.get("/api/scenarios").json()
+        assert {item["id"] for item in scenarios} >= {"warehouse_v0", "warehouse_low_friction_v0"}
+        response = client.post("/api/suite-evaluations", json={
+            "suite_id": "warehouse_smoke", "candidate_policy_id": "baseline_safe",
+            "baseline_policy_id": "baseline_safe", "engine_id": "deterministic_mock_v1",
+        })
+        assert response.status_code == 202
+        evaluation_id = response.json()["id"]
+        assert response.json()["total_pairs"] == 3
+
+    while claimed := store.claim_next():
+        execute_mock_run(store, claimed, tmp_path, frame_delay=0,
+                         scenario_path=settings.scenario_path_for(claimed.scenario_id))
+
+    with TestClient(create_app(settings)) as restarted:
+        evaluation = restarted.get(f"/api/suite-evaluations/{evaluation_id}").json()
+    assert evaluation["status"] == "complete"
+    assert evaluation["verdict"] == "pass"
+    assert evaluation["completed_pairs"] == 3
+    assert {item["scenario_id"] for item in evaluation["scenario_results"]} == {
+        "warehouse_v0", "warehouse_low_friction_v0",
+    }
+
+
+def test_scenario_ids_cannot_escape_world_registry(tmp_path: Path) -> None:
+    with TestClient(create_app(settings_for(tmp_path))) as client:
+        response = client.post("/api/runs", json={"scenario_id": "../../secrets", "policy_id": "baseline_safe"})
+    assert response.status_code == 422
+    assert "Invalid scenario ID" in response.json()["detail"]
+
+
+def test_docker_policy_runner_contract_is_hardened(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("worldsim.policy_sandbox.shutil.which", lambda _: "docker")
+    config = PolicyRunnerConfig(mode="docker", docker_image="candidate:test", cpu_limit=.5, memory_mb=256, pids_limit=32)
+    command = config.command("baseline_safe", "python")
+    joined = " ".join(command)
+    assert "--network none" in joined
+    assert "--read-only" in command
+    assert "--cap-drop ALL" in joined
+    assert "no-new-privileges" in command
+    assert "--cpus 0.5" in joined
+    assert "--memory 256m" in joined
+    assert command[-1] == "baseline_safe"
+
+    monkeypatch.setattr("worldsim.policy_sandbox.shutil.which", lambda _: None)
+    with pytest.raises(PolicyRunnerConfigurationError, match="docker CLI is unavailable"):
+        config.command("baseline_safe", "python")
+
+
+def test_policy_startup_failure_still_writes_verified_evidence(tmp_path: Path) -> None:
+    from worldsim.mujoco_engine import MujocoEngine
+
+    settings = settings_for(tmp_path)
+    store = RunStore(settings.db_path)
+    store.create_run(RunCreate(policy_id="python:module_that_does_not_exist:Policy",
+                               engine_id="mujoco_v1", seed=4))
+    claimed = store.claim_next()
+    assert claimed
+    evidence = MujocoEngine(settings.scenario_path).execute(store, claimed, tmp_path, frame_delay=0)
+    run = store.get_run(claimed.id)
+
+    assert run and run.status == "failed" and run.verdict == "error"
+    assert "ModuleNotFoundError" in (run.error or "")
+    assert evidence["metrics"]["frames_recorded"] == 1
+    assert verify_evidence_bundle(tmp_path / "runs" / claimed.id)[0] is True
+
+
+def test_comparison_rejects_different_worlds(tmp_path: Path) -> None:
+    settings = settings_for(tmp_path)
+    store = RunStore(settings.db_path)
+    first = store.create_run(RunCreate(scenario_id="warehouse_v0", seed=1))
+    second = store.create_run(RunCreate(scenario_id="warehouse_low_friction_v0", seed=1))
+    with TestClient(create_app(settings)) as client:
+        response = client.get(f"/api/runs/{first.id}/compare/{second.id}")
+    assert response.status_code == 422
+    assert "same scenario" in response.json()["detail"]
+
+
+def test_low_friction_world_executes_with_real_physics(tmp_path: Path) -> None:
+    from worldsim.mujoco_engine import MujocoEngine
+
+    settings = settings_for(tmp_path)
+    scenario_path = settings.scenario_path_for("warehouse_low_friction_v0")
+    store = RunStore(settings.db_path)
+    store.create_run(RunCreate(scenario_id="warehouse_low_friction_v0", policy_id="baseline_safe",
+                               engine_id="mujoco_v1", seed=2))
+    claimed = store.claim_next()
+    assert claimed
+    evidence = MujocoEngine(scenario_path).execute(store, claimed, tmp_path, frame_delay=0)
+
+    assert evidence["scenario_id"] == "warehouse_low_friction_v0"
+    assert evidence["scenario_snapshot"]["world"]["floor_friction"] == .42
+    assert evidence["metrics"]["frames_recorded"] > 1
+    assert evidence["engine"]["physics"] is True
+    assert verify_evidence_bundle(tmp_path / "runs" / claimed.id)[0] is True

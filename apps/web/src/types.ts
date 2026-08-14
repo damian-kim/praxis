@@ -121,5 +121,16 @@ export interface Experiment {
   summary: ExperimentSummary; gate_results: GateResult[]; pairs: SeedComparison[];
 }
 
-export interface EvaluationSuite { id: string; name: string; description: string; scenario_id: string; seeds: number[]; purpose: string; }
+export interface ScenarioInfo { id: string; name: string; objective: string; schema_version: string; }
+export interface SuiteCase { scenario_id: string; seeds: number[]; }
+export interface EvaluationSuite {
+  id: string; name: string; description: string; cases: SuiteCase[]; pair_count: number;
+  scenario_id: string; seeds: number[]; purpose: string;
+}
+export interface SuiteEvaluation {
+  id: string; suite_id: string; candidate_policy_id: string; baseline_policy_id: string; engine_id: string;
+  experiment_ids: string[]; created_at: string; status: "running" | "complete";
+  verdict: "pending" | "pass" | "fail"; completed_pairs: number; total_pairs: number;
+  scenario_results: Experiment[];
+}
 export interface Health { status: string; database: string; worker_seen_at: string | null; active_workers: number; active_runs: number; queued_runs: number; }

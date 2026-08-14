@@ -31,6 +31,20 @@ def load_scenario(path: Path, seed: int) -> dict:
     return episode
 
 
+def discover_scenarios(worlds_dir: Path) -> list[dict]:
+    scenarios = []
+    if not worlds_dir.exists():
+        return scenarios
+    for path in sorted(worlds_dir.glob("*/scenario.json")):
+        definition = load_scenario(path, 0)
+        scenarios.append({
+            "id": definition["id"],
+            "name": definition["name"],
+            "objective": definition["task"]["objective"],
+            "schema_version": definition["schema_version"],
+        })
+    return scenarios
+
+
 def threshold_values(scenario: dict) -> dict[str, float | bool]:
     return {name: definition["value"] for name, definition in scenario["limits"].items()}
-

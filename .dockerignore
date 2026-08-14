@@ -1,0 +1,6 @@
+.git
+.worldsim
+.pytest_cache
+apps/web/node_modules
+apps/web/dist
+**/__pycache__

@@ -8,6 +8,10 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from .config import Settings
+from .policy_sandbox import PolicyRunnerConfig
+from .scenario import discover_scenarios
+
 
 def parse_seeds(value: str) -> list[int]:
     seeds = []
@@ -100,6 +104,45 @@ def evaluate(args: argparse.Namespace) -> int:
         return 2
 
 
+def evaluate_suite(args: argparse.Namespace) -> int:
+    try:
+        payload = {
+            "suite_id": args.suite, "candidate_policy_id": args.candidate,
+            "baseline_policy_id": args.baseline, "engine_id": args.engine,
+        }
+        api_url = args.api_url.rstrip("/")
+        evaluation = request_json(f"{api_url}/api/suite-evaluations", "POST", payload)
+        print(f"Created {evaluation['id']} with {evaluation['total_pairs']} pairs")
+        if args.no_wait:
+            return 0
+        last_completed = -1
+        while evaluation["status"] != "complete":
+            if evaluation["completed_pairs"] != last_completed:
+                print(f"Completed pairs: {evaluation['completed_pairs']}/{evaluation['total_pairs']}")
+                last_completed = evaluation["completed_pairs"]
+            time.sleep(args.poll_interval)
+            evaluation = request_json(f"{api_url}/api/suite-evaluations/{evaluation['id']}")
+        for result in evaluation["scenario_results"]:
+            print(f"{result['verdict'].upper():4} {result['scenario_id']}: {result['summary']['candidate_pass_rate']:.1%} candidate pass rate")
+        print(f"Suite verdict: {evaluation['verdict'].upper()}")
+        return 0 if evaluation["verdict"] == "pass" else 1
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+
+def doctor(_: argparse.Namespace) -> int:
+    settings = Settings.from_env()
+    root = settings.worlds_dir or settings.scenario_path.parent.parent
+    report = {
+        "database": str(settings.db_path),
+        "scenarios": discover_scenarios(root),
+        "policy_runners": PolicyRunnerConfig.from_env().diagnostics(),
+    }
+    print(json.dumps(report, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="praxis", description="Praxis Worlds evaluation CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -121,6 +164,17 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--csv")
     command.add_argument("--junit")
     command.set_defaults(func=evaluate)
+    suite = subparsers.add_parser("suite-evaluate", help="Run a versioned multi-world evaluation suite")
+    suite.add_argument("--suite", default="warehouse_smoke")
+    suite.add_argument("--candidate", required=True)
+    suite.add_argument("--baseline", default="baseline_safe")
+    suite.add_argument("--engine", choices=["mujoco_v1", "deterministic_mock_v1"], default="mujoco_v1")
+    suite.add_argument("--api-url", default="http://127.0.0.1:8010")
+    suite.add_argument("--poll-interval", type=float, default=.5)
+    suite.add_argument("--no-wait", action="store_true")
+    suite.set_defaults(func=evaluate_suite)
+    diagnostics = subparsers.add_parser("doctor", help="Inspect worlds and policy isolation availability")
+    diagnostics.set_defaults(func=doctor)
     return parser
 
 

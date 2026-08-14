@@ -15,6 +15,7 @@ from .evaluator import evaluate
 from .evidence import write_evidence_bundle
 from .policy import EpisodeContext
 from .policy_runtime import IsolatedPolicyClient, PolicyRuntimeError, PROTOCOL_VERSION
+from .policy_sandbox import PolicyRunnerConfigurationError
 from .scenario import load_scenario
 from .store import RunStore
 
@@ -136,7 +137,6 @@ class MujocoEngine:
         goal = tuple(scenario["task"]["delivery_zone"])
         decision_timeout_ms = int(scenario["policy"]["decision_timeout_ms"])
         policy = IsolatedPolicyClient(run.policy_id, EpisodeContext(scenario=scenario), timeout_ms=decision_timeout_ms)
-        policy.start()
         package_geom = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "package_geom")
         finger_geoms = {
             mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "robot_left_finger"),
@@ -157,9 +157,14 @@ class MujocoEngine:
         decision_times: list[float] = []
         cancelled = False
         policy_error: str | None = None
+        try:
+            policy.start()
+        except (PolicyRuntimeError, PolicyRunnerConfigurationError, OSError) as exc:
+            policy_error = str(exc)
+            store.append_event(run.id, "policy_error", f"Policy failed to start: {policy_error}", 0)
         store.update_run(run.id, status="running", progress=.08, phase="Executing rigid-body episode")
 
-        for sequence in range(max_steps):
+        for sequence in (range(max_steps) if not policy_error else []):
             if store.is_cancel_requested(run.id):
                 cancelled = True
                 store.append_event(run.id, "lifecycle", "Worker acknowledged cancellation", sequence * .1)
@@ -286,6 +291,7 @@ class MujocoEngine:
                    "grasp_qualified": grasp_qualified, "grasp_finger_contacts": len(finger_contacts),
                    "policy_steps": len(policy_trace),
                    "policy_isolated": True, "policy_protocol_version": PROTOCOL_VERSION,
+                   "policy_runner_mode": policy.runner.mode,
                    "policy_decision_timeout_ms": decision_timeout_ms,
                    "policy_decision_mean_ms": round(sum(decision_times) / len(decision_times), 4) if decision_times else 0,
                    "policy_decision_max_ms": round(max(decision_times), 4) if decision_times else 0}
